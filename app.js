@@ -482,7 +482,7 @@ const MODEL_DESCRIPTIONS = {
 };
 const WORKSPACE_TAB_KEYS = ["chat", "sandbox", "math"];
 /** Visible text chat models shown in the composer. Image uploads use the backend vision route. */
-const COMPOSER_TEXT_MODEL_ORDER = [HERMES_MODEL_ID, DAEDALUS_MODEL_ID];
+const COMPOSER_TEXT_MODEL_ORDER = [HERMES_MODEL_ID, DAEDALUS_MODEL_ID, HYPERION_MODEL_ID];
 const COMPOSER_MODEL_GROUPS = [
   { label: "ROK", modelIds: [HERMES_MODEL_ID, DAEDALUS_MODEL_ID, HYPERION_MODEL_ID] }
 ];
