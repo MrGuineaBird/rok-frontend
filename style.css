@@ -7690,20 +7690,20 @@ a.server-down-btn {
 
 @media (max-width: 540px) {
   .composer-field {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    align-items: center;
   }
 
   .composer-field-textarea,
   .composer-field textarea {
-    border-radius: 12px 12px 0 0;
+    border-radius: 12px;
   }
 
   .composer-field-rail {
-    border-left: none;
-    border-top: 1px solid rgba(90, 50, 50, 0.45);
-    justify-content: flex-end;
-    padding: 8px 10px 10px;
+    border-top: none;
+    border-left: 1px solid rgba(90, 50, 50, 0.45);
+    justify-content: center;
+    padding: 0 10px;
   }
 
   .app.empty-chat-mode .main:not(.workspace-mode) .composer {

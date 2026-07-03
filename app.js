@@ -430,7 +430,7 @@ const TITAN_MODEL_ID = "qwen3.5:397b-cloud";
 const DAEDALUS_MODEL_ID = "glm-4.7:cloud";
 const HYPERION_LEGACY_MODEL_ID = "qwen3-coder:480b-cloud";
 const HYPERION_LEGACY_MODEL_ID_COGITO = "cogito-2.1:671b-cloud";
-const HYPERION_MODEL_ID = "minimax-m3:cloud";
+const HYPERION_MODEL_ID = "NVIDIA_HYPERION_TEST";
 const DAEDALUS_LEGACY_MODEL_ID = "deepseek-v3.2:cloud";
 const DAEDALUS_LEGACY_MODEL_ID_ALT = "glm-5.1:cloud";
 const CHEESE_MODEL_ID = "gpt-oss:20b-cheese";
@@ -501,7 +501,7 @@ function getModelTierBadgeLabel(modelId = "") {
 }
 const DEFAULT_TITAN_LOCK_WINDOW_MS = 3 * 60 * 60 * 1000;
 const DEFAULT_DAEDALUS_LOCK_WINDOW_MS = 60 * 60 * 1000;
-const SANDBOX_DEFAULT_PROMPT = "Analyze this ROK CODE project and propose the next file-by-file code changes.";
+const SANDBOX_DEFAULT_PROMPT = "Analyze and improve this code.";
 const SANDBOX_MAX_FILES = 48;
 const SANDBOX_MAX_FILE_CHARS = 24_000;
 const SANDBOX_CHANGE_PREVIEW_CONTEXT_LINES = 2;
@@ -4575,32 +4575,7 @@ function requestCustomOllamaCloudSetup(options = {}) {
 }
 
 function hasSeenHyperionAnnouncement() {
-  if (isIncognitoModeEnabled()) return true;
-  try {
-    const raw = localStorage.getItem(LOCAL_HYPERION_ANNOUNCEMENT_KEY);
-    if (!raw) return false;
-    if (raw === "1") return true;
-    const parsed = JSON.parse(raw);
-    return Boolean(parsed && parsed.seen === true && parsed.version === 1);
-  } catch {
-    return false;
-  }
-}
-
-function markHyperionAnnouncementSeen() {
-  if (isIncognitoModeEnabled()) return;
-  try {
-    localStorage.setItem(
-      LOCAL_HYPERION_ANNOUNCEMENT_KEY,
-      JSON.stringify({
-        seen: true,
-        version: 1,
-        seenAt: new Date().toISOString()
-      })
-    );
-  } catch {
-    // Ignore storage write failures.
-  }
+  return true;
 }
 
 function isHyperionAnnouncementBlocked() {
@@ -4613,95 +4588,8 @@ function isHyperionAnnouncementBlocked() {
   return false;
 }
 
-function openHyperionAnnouncementModal() {
-  if (hasSeenHyperionAnnouncement()) return;
-  if (document.getElementById("hyperionAnnouncementModal")) return;
-
-  const overlay = document.createElement("div");
-  overlay.id = "hyperionAnnouncementModal";
-  overlay.className = "correction-modal-overlay hyperion-announcement-overlay";
-  overlay.setAttribute("role", "presentation");
-
-  const keyLine = "No Ollama Cloud key needed. Hyperion now runs through ROK's server lane.";
-  const ctaLabel = "Use Hyperion";
-
-  overlay.innerHTML = `
-    <div class="correction-modal hyperion-announcement-modal" role="dialog" aria-modal="true" aria-labelledby="hyperionAnnouncementTitle">
-      <div class="hyperion-announcement-glow"></div>
-      <div class="hyperion-announcement-top">
-        <span class="hyperion-announcement-mark">H</span>
-        <span class="hyperion-announcement-kicker">Hyperion</span>
-        <button class="hyperion-announcement-close" type="button" data-hyperion-announcement-dismiss aria-label="Close Hyperion announcement">Close</button>
-      </div>
-      <h2 id="hyperionAnnouncementTitle" class="hyperion-announcement-title">ROK's own cyber security expert</h2>
-      <p class="hyperion-announcement-copy">
-        Use Hyperion to review code, find broken auth, session, CORS, rate-limit, SSRF, XSS, SQLi, path traversal, and catch anything wrong before it ships.
-      </p>
-      <div class="hyperion-announcement-chips" aria-label="Hyperion strengths">
-        <span>Secure code review</span>
-        <span>Vulnerability analysis</span>
-        <span>Threat modeling</span>
-        <span>CTF learning</span>
-      </div>
-      <div class="hyperion-announcement-note">${keyLine}</div>
-      <div class="correction-modal-btns hyperion-announcement-actions">
-        <button class="correction-modal-cancel" type="button" data-hyperion-announcement-dismiss>Later</button>
-        <button class="correction-modal-submit" type="button" data-hyperion-announcement-cta>${ctaLabel}</button>
-      </div>
-    </div>
-  `;
-
-  const closeModal = () => {
-    markHyperionAnnouncementSeen();
-    document.removeEventListener("keydown", keydownHandler);
-    if (overlay.parentNode) {
-      overlay.parentNode.removeChild(overlay);
-    }
-  };
-
-  const openHyperion = () => {
-    closeModal();
-    setCurrentSessionModel(HYPERION_MODEL_ID);
-    playHyperionUnlockAnimation();
-    showThinkingQuotaToast("Hyperion is ready for security review.");
-  };
-
-  const keydownHandler = (event) => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    closeModal();
-  };
-
-  overlay.addEventListener("click", (event) => {
-    if (event.target === overlay) {
-      closeModal();
-    }
-  });
-  overlay.querySelectorAll("[data-hyperion-announcement-dismiss]").forEach((button) => {
-    button.addEventListener("click", closeModal);
-  });
-  const cta = overlay.querySelector("[data-hyperion-announcement-cta]");
-  if (cta) {
-    cta.addEventListener("click", openHyperion);
-  }
-  document.addEventListener("keydown", keydownHandler);
-  document.body.appendChild(overlay);
-}
-
-function scheduleHyperionAnnouncement(attempt = 0) {
-  if (hasSeenHyperionAnnouncement()) return;
-  const delay = attempt === 0 ? 900 : 1200;
-  setTimeout(() => {
-    if (hasSeenHyperionAnnouncement()) return;
-    if (isHyperionAnnouncementBlocked()) {
-      if (attempt < 120) {
-        scheduleHyperionAnnouncement(attempt + 1);
-      }
-      return;
-    }
-    openHyperionAnnouncementModal();
-  }, delay);
-}
+function openHyperionAnnouncementModal() { /* disabled */ }
+function scheduleHyperionAnnouncement(attempt = 0) { /* disabled */ }
 
 function buildCustomizationModelChoices(currentDefaultModel = "") {
   const seen = new Set();
@@ -16846,6 +16734,9 @@ function bindWorkspaceTabClickEvents(tabContainer) {
     }
     const tab = tabBtn.getAttribute("data-workspace-tab");
     if (!tab) return;
+    if (tab === "sandbox") {
+      setCurrentSessionModel(HYPERION_MODEL_ID);
+    }
     setActiveWorkspaceTab(tab, { focus: true });
   });
 }

@@ -367,7 +367,7 @@
                   <div id="sandboxChangesSummary" class="workspace-panel-hint">No AI file changes yet.</div>
                 </div>
                 <div id="sandboxChangesList" class="sandbox-changes-list">
-                  <div class="sandbox-empty-state">No file changes yet. Ask ROK to build or edit something in ROK CODE.</div>
+                  <div class="sandbox-empty-state">No file changes yet.</div>
                 </div>
                 <div id="sandboxChangesMeta" class="sandbox-setup-note" hidden></div>
               </section>
@@ -377,25 +377,24 @@
             <div class="workspace-panel-head sandbox-chat-head">
               <div class="workspace-panel-title">Requests</div>
               <div class="workspace-panel-hint">
-                Ask for one focused edit, review the plan, then apply.
+                Ask ROK for a code task.
               </div>
               <div class="workspace-panel-actions">
-                <button id="sandboxAnalyzeBtn" class="workspace-mini-btn ghost" type="button">Analyze</button>
-                <button id="sandboxClearAnalysisBtn" class="workspace-mini-btn ghost" type="button">Clear</button>
+                <button id="sandboxAnalyzeBtn" class="workspace-mini-btn ghost" type="button" hidden>Analyze</button>
+                <button id="sandboxClearAnalysisBtn" class="workspace-mini-btn ghost" type="button" hidden>Clear</button>
               </div>
             </div>
             <div id="sandboxChatList" class="sandbox-chat-list" aria-live="polite">
-              <div class="sandbox-empty-state">No ROK CODE requests yet. Ask ROK to build or edit something here.</div>
+              <div class="sandbox-empty-state">Ask ROK to build or edit something.</div>
             </div>
             <div class="sandbox-chat-compose">
               <textarea
                 id="sandboxChatInput"
                 class="sandbox-chat-input"
-                placeholder="Describe one bug, refactor, or small feature."
+                placeholder="Describe a code task."
                 spellcheck="true"
               ></textarea>
               <div class="sandbox-chat-compose-actions">
-                <div class="sandbox-setup-note">Plans are reviewed before they touch your files.</div>
                 <button id="sandboxChatSendBtn" class="workspace-mini-btn" type="button">Send</button>
               </div>
             </div>
@@ -824,26 +823,6 @@ Change Scope: Short</p>
     </div>
   </section>
 
-  <!-- One-time forum survey modal -->
-  <section id="forumSurveyModal" class="burnout-modal" hidden aria-hidden="true">
-    <div class="burnout-card" role="dialog" aria-modal="true" aria-labelledby="forumSurveyTitle">
-      <div class="burnout-head">
-        <span class="burnout-badge" style="background: linear-gradient(135deg, #d14b4b, #ff7a59);">Quick favor</span>
-        <button id="forumSurveyCloseBtn" class="burnout-close" type="button" aria-label="Close">✕</button>
-      </div>
-      <div style="padding: 20px 0;">
-        <h2 id="forumSurveyTitle" style="font-size: 20px; margin-bottom: 16px;">Help shape where ROK goes next.</h2>
-        <div class="burnout-body" style="text-align: left; line-height: 1.6;">
-          <p>I'm trying to make ROK more worth using, and I want blunt feedback from actual users.</p>
-          <p>This short forum asks what matters most to you in ROK, what would make it worth paying for, and what you actually want next.</p>
-          <p style="margin-top: 18px; color: var(--text-2);">If you have two minutes, it would help a lot.</p>
-        </div>
-      </div>
-      <div style="display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap;">
-        <button id="forumSurveyMaybeLaterBtn" class="correction-modal-cancel" type="button">Maybe later</button>
-        <button id="forumSurveyTakeBtn" class="burnout-btn" type="button" style="background: linear-gradient(135deg, #d14b4b, #ff7a59);">Take the forum</button>
-      </div>
-    </div>
   </section>
 
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
