@@ -442,7 +442,7 @@ const HERMES_LABEL = "Hermes 1.4";
 const HERMES_PROVIDER_NAME = "GPT-OSS 120B Cloud";
 const DAEDALUS_LABEL = "Daedalus 1.2";
 const DAEDALUS_PROVIDER_NAME = "GLM 4.7 Cloud";
-const HYPERION_LABEL = "Hyperion";
+const HYPERION_LABEL = "Hyperion 2";
 const HYPERION_PROVIDER_NAME = "MiniMax M3 Cloud";
 const DEFAULT_MODEL_OPTIONS = [
   { id: HERMES_MODEL_ID, label: HERMES_LABEL },
