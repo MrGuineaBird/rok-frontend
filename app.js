@@ -6822,36 +6822,25 @@ function buildSandboxActivitySnapshot(activity = getActiveSandboxActivity(), san
   const primaryPath = targetPaths[0] || activity.selectedPath || "";
   const createIntent = /\b(create|make|build|scaffold|add|start|new(?:\s+file|\s+component|\s+page)?)\b/i.test(prompt);
   const fileCountLabel = `${fileCount} file${fileCount === 1 ? "" : "s"}`;
-  const runningSteps = [
-    {
-      label: fileCount ? `Reading ${fileCountLabel}` : "Reading your request",
-      detail: fileCount
-        ? "Loading the current ROK CODE workspace into the planner."
-        : "No code files yet, so ROK is using your request and uploads."
-    },
-    {
-      label: primaryPath ? `Inspecting ${primaryPath}` : "Inspecting your request",
-      detail: promptSummary
-    },
-    {
-      label: primaryPath
-        ? `Drafting changes for ${primaryPath}`
-        : createIntent
-        ? "Planning new files"
-        : "Drafting file changes",
-      detail: targetPaths.length > 1
-        ? `Likely touching ${targetPaths.length} files in this pass.`
-        : "Turning the request into concrete code edits."
-    },
-    {
-      label: "Preparing apply-ready changes",
-      detail: "Formatting the plan so you can review it and apply it in ROK CODE."
-    }
-  ];
-
   const endTime = state === "running" ? Date.now() : Number(activity.completedAt) || Date.now();
   const elapsedMs = Math.max(0, endTime - (Number(activity.startedAt) || endTime));
   const elapsedText = formatSandboxActivityDuration(elapsedMs);
+
+  if (state === "running") {
+    return {
+      state,
+      title: "ROK is working",
+      status: activity.message || "Analyzing your request...",
+      detail: activity.message || promptSummary,
+      message: activity.message || "",
+      elapsedText,
+      chipText: "Working",
+      changeText: "Processing",
+      targetPaths,
+      planFiles,
+      steps: []
+    };
+  }
 
   if (state === "success") {
     const planCount = planFiles.length;
@@ -6865,7 +6854,8 @@ function buildSandboxActivitySnapshot(activity = getActiveSandboxActivity(), san
       state,
       title: planCount ? `Plan ready for ${planCount} file${planCount === 1 ? "" : "s"}` : "Plan ready",
       status: "Ready to apply",
-      detail: activity.summary || "ROK finished building the file-by-file plan.",
+      detail: activity.message || activity.summary || "ROK finished building the file-by-file plan.",
+      message: activity.message || "",
       elapsedText,
       chipText: "Plan ready",
       changeText: planCount ? `${planCount} AI change${planCount === 1 ? "" : "s"}` : "No AI changes",
