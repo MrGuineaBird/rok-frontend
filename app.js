@@ -39,7 +39,6 @@ const sandboxCollapseFilesBtn = document.getElementById("sandboxCollapseFilesBtn
 const sandboxCollapseChatBtn = document.getElementById("sandboxCollapseChatBtn");
 const sandboxFilesShell = document.getElementById("sandboxFilesShell");
 const sandboxChatShell = document.getElementById("sandboxChatShell");
-const sandboxPanel = document.getElementById("sandboxPanel");
 const sandboxFilePathInput = document.getElementById("sandboxFilePathInput");
 const sandboxFileEditor = document.getElementById("sandboxFileEditor");
 const sandboxChangesSummary = document.getElementById("sandboxChangesSummary");
