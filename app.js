@@ -7005,32 +7005,17 @@ function renderSandboxActivityUI(activitySnapshot) {
 
   sandboxActivityShell.hidden = false;
   sandboxActivityShell.dataset.state = activitySnapshot.state || "running";
-  sandboxActivityTitle.textContent = activitySnapshot.title || "ROK is working";
-  sandboxActivityStatus.textContent = activitySnapshot.status || activitySnapshot.detail || "Preparing your code plan.";
+  
+  // Use conversational message if available, otherwise fall back to status
+  const conversationalMessage = activitySnapshot.message || activitySnapshot.status || activitySnapshot.detail || "Preparing your code plan.";
+  
+  sandboxActivityTitle.textContent = "ROK";
+  sandboxActivityStatus.textContent = conversationalMessage;
   sandboxActivityElapsed.textContent = activitySnapshot.elapsedText || "0s";
-  sandboxActivityList.innerHTML = (activitySnapshot.steps || [])
-    .map((step) => {
-      const badgeLabel = step.state === "done"
-        ? "Done"
-        : step.state === "active"
-        ? "Now"
-        : step.state === "error"
-        ? "Issue"
-        : step.state === "stopped"
-        ? "Stopped"
-        : "Next";
-      return `
-        <div class="sandbox-activity-step" data-state="${escapeHtml(step.state || "pending")}">
-          <div class="sandbox-activity-step-head">
-            <span class="sandbox-activity-step-dot" aria-hidden="true"></span>
-            <span class="sandbox-activity-step-title">${escapeHtml(step.label || "")}</span>
-            <span class="sandbox-activity-step-badge">${escapeHtml(badgeLabel)}</span>
-          </div>
-          <div class="sandbox-activity-step-detail">${escapeHtml(step.detail || "")}</div>
-        </div>
-      `;
-    })
-    .join("");
+  
+  // Hide the step list for conversational mode
+  sandboxActivityList.innerHTML = "";
+  sandboxActivityList.hidden = true;
 }
 
 function getSandboxStarterPrompt(starterId = "") {
