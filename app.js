@@ -22,34 +22,18 @@ const workspaceDownloadBtn = document.getElementById("workspaceDownloadBtn");
 const workspaceImproveBtn = document.getElementById("workspaceImproveBtn");
 const sandboxPanel = document.getElementById("sandboxPanel");
 const sandboxFilesList = document.getElementById("sandboxFilesList");
-const sandboxCurrentFileLabel = document.getElementById("sandboxCurrentFileLabel");
-const sandboxFileCount = document.getElementById("sandboxFileCount");
-const sandboxChangeCount = document.getElementById("sandboxChangeCount");
-const sandboxStatusChip = document.getElementById("sandboxStatusChip");
 const sandboxUploadBtn = document.getElementById("sandboxUploadBtn");
-const sandboxUploadFolderBtn = document.getElementById("sandboxUploadFolderBtn");
 const sandboxNewFileBtn = document.getElementById("sandboxNewFileBtn");
 const sandboxSaveBtn = document.getElementById("sandboxSaveBtn");
-const sandboxDeleteBtn = document.getElementById("sandboxDeleteBtn");
-const sandboxAnalyzeBtn = document.getElementById("sandboxAnalyzeBtn");
-const sandboxUndoBtn = document.getElementById("sandboxUndoBtn");
 const sandboxApplyBtn = document.getElementById("sandboxApplyBtn");
-const sandboxClearAnalysisBtn = document.getElementById("sandboxClearAnalysisBtn");
 const sandboxCollapseFilesBtn = document.getElementById("sandboxCollapseFilesBtn");
 const sandboxCollapseChatBtn = document.getElementById("sandboxCollapseChatBtn");
 const sandboxFilesShell = document.getElementById("sandboxFilesShell");
 const sandboxChatShell = document.getElementById("sandboxChatShell");
 const sandboxFilePathInput = document.getElementById("sandboxFilePathInput");
 const sandboxFileEditor = document.getElementById("sandboxFileEditor");
-const sandboxChangesSummary = document.getElementById("sandboxChangesSummary");
-const sandboxChangesList = document.getElementById("sandboxChangesList");
-const sandboxChangesMeta = document.getElementById("sandboxChangesMeta");
 const sandboxActivityShell = document.getElementById("sandboxActivityShell");
-const sandboxActivityTitle = document.getElementById("sandboxActivityTitle");
 const sandboxActivityStatus = document.getElementById("sandboxActivityStatus");
-const sandboxActivityElapsed = document.getElementById("sandboxActivityElapsed");
-const sandboxActivityList = document.getElementById("sandboxActivityList");
-const sandboxChatList = document.getElementById("sandboxChatList");
 const sandboxChatInput = document.getElementById("sandboxChatInput");
 const sandboxChatSendBtn = document.getElementById("sandboxChatSendBtn");
 const workspaceAssistantPanel = document.getElementById("workspaceAssistantPanel");
@@ -6982,13 +6966,12 @@ function buildSandboxActivityChatText(activitySnapshot) {
 }
 
 function renderSandboxActivityUI(activitySnapshot) {
-  if (!sandboxActivityShell || !sandboxActivityTitle || !sandboxActivityStatus || !sandboxActivityElapsed || !sandboxActivityList) {
+  if (!sandboxActivityShell || !sandboxActivityStatus) {
     return;
   }
   if (!activitySnapshot) {
     sandboxActivityShell.hidden = true;
     sandboxActivityShell.removeAttribute("data-state");
-    sandboxActivityList.textContent = "";
     return;
   }
 
@@ -6998,13 +6981,7 @@ function renderSandboxActivityUI(activitySnapshot) {
   // Use conversational message if available, otherwise fall back to status
   const conversationalMessage = activitySnapshot.message || activitySnapshot.status || activitySnapshot.detail || "Preparing your code plan.";
   
-  sandboxActivityTitle.textContent = "ROK";
   sandboxActivityStatus.textContent = conversationalMessage;
-  sandboxActivityElapsed.textContent = activitySnapshot.elapsedText || "0s";
-  
-  // Hide the step list for conversational mode
-  sandboxActivityList.innerHTML = "";
-  sandboxActivityList.hidden = true;
 }
 
 function getSandboxStarterPrompt(starterId = "") {
@@ -7383,10 +7360,6 @@ function setSandboxStatus(statusText, tone = "idle", options = {}) {
   const { save = true } = options;
   const sandbox = getCurrentSandboxState();
   sandbox.statusText = String(statusText || "").trim() || "Idle";
-  if (sandboxStatusChip) {
-    sandboxStatusChip.textContent = sandbox.statusText;
-    sandboxStatusChip.dataset.tone = tone;
-  }
   if (save) {
     syncCurrentSessionFromHistory();
   }
@@ -7406,10 +7379,6 @@ function loadSandboxDraftFromSelectedFile(force = false) {
 
 function markSandboxDraftDirty() {
   sandboxDraftDirty = true;
-  if (sandboxStatusChip) {
-    sandboxStatusChip.textContent = "Unsaved";
-    sandboxStatusChip.dataset.tone = "idle";
-  }
 }
 
 function saveSandboxDraftToState(options = {}) {
@@ -7631,113 +7600,8 @@ function undoLastSandboxApply() {
 }
 
 function renderSandboxAnalysisUI(analysis, activitySnapshot = null) {
-  if (!sandboxChangesSummary || !sandboxChangesList || !sandboxChangesMeta) return;
-  if (activitySnapshot && activitySnapshot.state === "running") {
-    sandboxChangesSummary.textContent = "ROK is preparing the requested file changes...";
-    sandboxChangesList.innerHTML = buildSandboxEmptyStateMarkup({
-      title: "ROK CODE is building the plan",
-      body: "The file-by-file change summary will appear here as soon as the current pass is ready to review.",
-      note: "Nothing is written into the workspace until you click Apply Changes."
-    });
-    sandboxChangesMeta.hidden = true;
-    sandboxChangesMeta.textContent = "";
-    return;
-  }
-
-  const changeSet = getSandboxAnalysisChangeRows(analysis);
-  const fileCount = changeSet.rows.length;
-  if (!fileCount) {
-    sandboxChangesSummary.textContent = "No AI file changes yet.";
-    sandboxChangesList.innerHTML = buildSandboxEmptyStateMarkup({
-      title: "No requested changes yet",
-      body: "Ask for one concrete edit and the review cards will show up here before anything gets applied.",
-      actions: [
-        { kind: "starter", id: "review", label: "Review workspace", tone: "primary" },
-        { kind: "starter", id: "refactor", label: "Safe refactor" },
-        { kind: "starter", id: "debug", label: "Find the bug" }
-      ],
-      note: "Best results come from one safe request at a time."
-    });
-    sandboxChangesMeta.hidden = true;
-    sandboxChangesMeta.textContent = "";
-    return;
-  }
-
-  const currentExpandedPaths = getSandboxExpandedChangePaths();
-  const validExpandedPaths = new Set(
-    currentExpandedPaths.filter((path) => changeSet.rows.some((change) => change.path.toLowerCase() === path))
-  );
-  if (validExpandedPaths.size) {
-    setSandboxExpandedChangePaths([...validExpandedPaths]);
-  } else if (currentExpandedPaths.length) {
-    clearSandboxExpandedChangePaths();
-  }
-
-  sandboxChangesSummary.textContent = `Plan ready: ${fileCount} file${fileCount === 1 ? "" : "s"} | +${changeSet.additions} -${changeSet.deletions}`;
-  sandboxChangesList.innerHTML = changeSet.rows
-    .map((change, index) => {
-      const changePathKey = change.path.toLowerCase();
-      const isExpanded = validExpandedPaths.size
-        ? validExpandedPaths.has(changePathKey)
-        : index === 0 && fileCount <= 2;
-      const actionLabel = change.action === "create" ? "new" : change.action;
-      const reason = change.reason ? `<div class="sandbox-change-reason">${escapeHtml(change.reason)}</div>` : "";
-      const previewData = isExpanded ? buildSandboxChangePreviewData(change) : null;
-      const previewButtonLabel = isExpanded ? "Hide preview" : "Review preview";
-      const previewHtml = previewData
-        ? `
-          <div class="sandbox-change-preview">
-            <div class="sandbox-change-preview-grid${previewData.panes.length === 1 ? " is-single" : ""}">
-              ${previewData.panes.map((pane) => `
-                <section class="sandbox-change-preview-pane" data-tone="${escapeHtml(pane.tone || "current")}">
-                  <div class="sandbox-change-preview-label">${escapeHtml(pane.label || "")}</div>
-                  <pre class="sandbox-change-preview-code">${escapeHtml(pane.text || "")}</pre>
-                </section>
-              `).join("")}
-            </div>
-            ${previewData.note ? `<div class="sandbox-change-preview-note">${escapeHtml(previewData.note)}</div>` : ""}
-          </div>
-        `
-        : "";
-      const openFileButton = change.canOpenCurrentFile
-        ? `<button type="button" class="sandbox-change-mini-btn" data-sandbox-open-path="${escapeHtml(change.path)}">Open file</button>`
-        : "";
-
-      return `
-        <div class="sandbox-change-row" data-expanded="${isExpanded ? "true" : "false"}">
-          <div class="sandbox-change-head">
-            <div class="sandbox-change-main">
-              <div class="sandbox-change-path-row">
-                <span class="sandbox-change-path">${escapeHtml(change.path)}</span>
-                <span class="sandbox-change-action" data-tone="${escapeHtml(change.action)}">${escapeHtml(actionLabel)}</span>
-                <span class="sandbox-change-lines">${escapeHtml(getSandboxLineCountLabel(change.proposedLineCount || change.currentLineCount || 0))}</span>
-              </div>
-              ${reason}
-            </div>
-            <div class="sandbox-change-side">
-              <div class="sandbox-change-stats">
-                <span class="sandbox-change-plus">+${change.additions}</span>
-                <span class="sandbox-change-minus">-${change.deletions}</span>
-              </div>
-              <div class="sandbox-change-controls">
-                ${openFileButton}
-                <button type="button" class="sandbox-change-mini-btn" data-sandbox-preview-path="${escapeHtml(change.path)}">${escapeHtml(previewButtonLabel)}</button>
-              </div>
-            </div>
-          </div>
-          ${previewHtml}
-        </div>
-      `;
-    })
-    .join("");
-
-  if (changeSet.setupSteps.length) {
-    sandboxChangesMeta.hidden = false;
-    sandboxChangesMeta.textContent = `Setup: ${changeSet.setupSteps.join(" | ")}`;
-  } else {
-    sandboxChangesMeta.hidden = true;
-    sandboxChangesMeta.textContent = "";
-  }
+  // Changes panel removed in minimalistic UI - stub function
+  return;
 }
 
 function createSandboxChatMessageRow(role, text, options = {}) {
@@ -7762,33 +7626,7 @@ function createSandboxChatMessageRow(role, text, options = {}) {
 }
 
 function renderSandboxConversationUI(sandbox, activitySnapshot = null) {
-  if (!sandboxChatList) return;
-  const messages = getSandboxConversationMessages(sandbox);
-  sandboxChatList.textContent = "";
-
-  if (!messages.length && !(isSending && isSandboxSessionActive())) {
-    sandboxChatList.innerHTML = buildSandboxEmptyStateMarkup({
-      title: "Start with a focused request",
-      body: "Ask for one bug fix, refactor, or small feature. ROK CODE will plan before applying anything.",
-      actions: [
-        { kind: "starter", id: "review", label: "Review workspace", tone: "primary" },
-        { kind: "starter", id: "refactor", label: "Safe refactor" },
-        { kind: "starter", id: "debug", label: "Find the bug" },
-        { kind: "starter", id: "scaffold", label: "Starter scaffold" }
-      ],
-      note: "Nothing is written until you click Apply Changes."
-    });
-  } else {
-    messages.forEach((item) => {
-      sandboxChatList.appendChild(createSandboxChatMessageRow(item.role, item.content));
-    });
-    if (isSending && isSandboxSessionActive()) {
-      sandboxChatList.appendChild(
-        createSandboxChatMessageRow("assistant", buildSandboxActivityChatText(activitySnapshot), { pending: true })
-      );
-    }
-  }
-
+  // Chat list removed in minimalistic UI - stub function
   if (sandboxChatInput) {
     if (document.activeElement !== sandboxChatInput) {
       sandboxChatInput.value = sandboxChatDraft;
@@ -7797,10 +7635,9 @@ function renderSandboxConversationUI(sandbox, activitySnapshot = null) {
     autoResizeSandboxChatInput();
   }
   if (sandboxChatSendBtn) {
-    sandboxChatSendBtn.textContent = isSending ? "Stop" : "Send";
+    sandboxChatSendBtn.textContent = isSending ? "Stop" : "→";
     sandboxChatSendBtn.disabled = false;
   }
-  sandboxChatList.scrollTop = sandboxChatList.scrollHeight;
 }
 
 function renderSandboxUI() {
@@ -7846,30 +7683,6 @@ function renderSandboxUI() {
     });
   }
 
-  if (sandboxCurrentFileLabel) {
-    sandboxCurrentFileLabel.textContent = selectedFile ? selectedFile.path : "Select a file";
-  }
-  if (sandboxFileCount) {
-    sandboxFileCount.textContent = `${sandbox.files.length.toLocaleString()} file${sandbox.files.length === 1 ? "" : "s"}`;
-  }
-  if (sandboxChangeCount) {
-    const planFiles = Array.isArray(activeAnalysis.files) ? activeAnalysis.files.length : 0;
-    sandboxChangeCount.textContent = activitySnapshot ? activitySnapshot.changeText : planFiles ? `${planFiles} AI change${planFiles === 1 ? "" : "s"}` : "No AI changes";
-  }
-  if (sandboxStatusChip) {
-    const chipText = activitySnapshot ? activitySnapshot.chipText : sandbox.statusText || "Idle";
-    const tone = activitySnapshot && activitySnapshot.state === "running"
-      ? "idle"
-      : chipText.toLowerCase().includes("error")
-      || chipText.toLowerCase().includes("required")
-      || chipText.toLowerCase().includes("exists")
-      ? "error"
-      : chipText === "Saved"
-      ? "saved"
-      : "idle";
-    sandboxStatusChip.textContent = chipText;
-    sandboxStatusChip.dataset.tone = tone;
-  }
   if (sandboxFilePathInput) {
     sandboxFilePathInput.value = selectedFile ? sandboxDraftPath : "";
     sandboxFilePathInput.disabled = !selectedFile || isSending;
@@ -16334,37 +16147,7 @@ if (sandboxFilesList) {
   });
 }
 
-if (sandboxChangesList) {
-  sandboxChangesList.addEventListener("click", (e) => {
-    const target = e.target;
-    if (!(target instanceof HTMLElement)) return;
-    if (handleSandboxEmptyStateAction(target)) return;
-
-    const previewButton = target.closest("[data-sandbox-preview-path]");
-    if (previewButton instanceof HTMLElement) {
-      const path = previewButton.getAttribute("data-sandbox-preview-path");
-      if (!path) return;
-      toggleSandboxExpandedChangePath(path);
-      renderSandboxUI();
-      return;
-    }
-
-    const openFileButton = target.closest("[data-sandbox-open-path]");
-    if (openFileButton instanceof HTMLElement) {
-      const path = openFileButton.getAttribute("data-sandbox-open-path");
-      if (!path) return;
-      selectSandboxFileByPath(path);
-    }
-  });
-}
-
-if (sandboxChatList) {
-  sandboxChatList.addEventListener("click", (e) => {
-    const target = e.target;
-    if (!(target instanceof HTMLElement)) return;
-    handleSandboxEmptyStateAction(target);
-  });
-}
+// Event listeners for deleted UI elements removed in minimalistic UI
 
 if (sandboxFilePathInput) {
   sandboxFilePathInput.addEventListener("input", () => {
