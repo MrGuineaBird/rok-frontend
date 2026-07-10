@@ -202,56 +202,9 @@
                   </button>
                   <button id="homePrivacyBtn" class="rok-home-secondary-btn" type="button">See How Privacy Works</button>
                 </div>
-                <a class="rok-home-scroll-cue" href="#rokHomeStory">Scroll to explore</a>
               </div>
             </section>
 
-            <section id="rokHomeStory" class="rok-home-section">
-              <div class="rok-home-section-kicker">Why ROK</div>
-              <h2 class="rok-home-section-title">Control first. Convenience second.</h2>
-              <div class="rok-home-card-grid">
-                <article class="rok-home-card">
-                  <span class="rok-home-card-title">Work you are not ready to paste anywhere</span>
-                  <p>ROK fits drafts, screenshots, notes, logs, and code that still feel too personal, messy, or unfinished for a generic cloud chat.</p>
-                </article>
-                <article class="rok-home-card">
-                  <span class="rok-home-card-title">Local or hosted, but visible</span>
-                  <p>Switch between ROK's models, your own local Ollama runtime, or your own Ollama Cloud model instead of getting locked into one hidden path.</p>
-                </article>
-                <article class="rok-home-card">
-                  <span class="rok-home-card-title">Built toward user control</span>
-                  <p>ROK is aiming to feel more like the Linux side of AI: configurable, transparent, and more community-shaped over time.</p>
-                </article>
-              </div>
-            </section>
-
-            <section id="rokHomeUseCases" class="rok-home-section rok-home-section-muted">
-              <div class="rok-home-section-kicker">Use ROK When</div>
-              <h2 class="rok-home-section-title">The work is yours and the choice matters.</h2>
-              <div class="rok-home-list-grid">
-                <div class="rok-home-list-item">you want chats stored on this device by default</div>
-                <div class="rok-home-list-item">you want to switch between ROK's models, your own local runtime, and your own Ollama Cloud model</div>
-                <div class="rok-home-list-item">the draft, diff, or screenshot is personal, unfinished, or sensitive</div>
-                <div class="rok-home-list-item">you want a tool that feels user-controlled instead of purely corporate</div>
-              </div>
-            </section>
-
-            <section id="rokHomeRuntime" class="rok-home-section">
-              <div class="rok-home-section-kicker">Runtime Choice</div>
-              <h2 class="rok-home-section-title">Choose the setup that fits the work.</h2>
-              <div class="rok-home-runtime-grid">
-                <article class="rok-home-runtime-card">
-                  <span class="rok-home-runtime-label">ROK Models</span>
-                  <h3>Fast hosted help</h3>
-                  <p>Use ROK's hosted models when you want speed, lower setup, and a quick way to get moving.</p>
-                </article>
-                <article class="rok-home-runtime-card">
-                  <span class="rok-home-runtime-label">Your Ollama</span>
-                  <h3>Local runtime or your own cloud key</h3>
-                  <p>Point ROK at your own local Ollama runtime, or save your own Ollama Cloud API key and model ID from the model picker when you want more control.</p>
-                </article>
-              </div>
-            </section>
           </main>
 
           <footer class="rok-home-footer">
@@ -303,14 +256,17 @@
           ></textarea>
         </div>
         <section id="sandboxPanel" class="sandbox-shell" hidden aria-live="polite">
-          <aside class="sandbox-files-shell">
+          <aside class="sandbox-files-shell" id="sandboxFilesShell">
             <div class="workspace-panel-head sandbox-files-head">
               <div class="workspace-panel-title">Explorer</div>
               <div class="workspace-panel-hint">Files</div>
               <div class="workspace-panel-actions">
-                <button id="sandboxUploadBtn" class="workspace-mini-btn ghost" type="button">Upload</button>
-                <button id="sandboxUploadFolderBtn" class="workspace-mini-btn ghost" type="button">Folder</button>
-                <button id="sandboxNewFileBtn" class="workspace-mini-btn ghost" type="button">New File</button>
+                <button id="sandboxCollapseFilesBtn" class="workspace-mini-btn ghost" type="button" title="Toggle file explorer (Ctrl+B)" aria-expanded="true" aria-controls="sandboxFilesList">
+                  <span class="collapse-icon">◀</span>
+                </button>
+                <button id="sandboxUploadBtn" class="workspace-mini-btn ghost" type="button" title="Upload files">Upload</button>
+                <button id="sandboxUploadFolderBtn" class="workspace-mini-btn ghost" type="button" title="Upload folder">Folder</button>
+                <button id="sandboxNewFileBtn" class="workspace-mini-btn ghost" type="button" title="Create new file (Ctrl+N)">New File</button>
               </div>
             </div>
             <div id="sandboxFilesList" class="sandbox-files-list"></div>
@@ -328,10 +284,10 @@
                   <span id="sandboxStatusChip" class="workspace-doc-chip" data-tone="idle">Idle</span>
                 </div>
                   <div class="workspace-panel-actions">
-                    <button id="sandboxSaveBtn" class="workspace-mini-btn ghost" type="button">Save</button>
-                    <button id="sandboxDeleteBtn" class="workspace-mini-btn ghost" type="button">Delete</button>
-                    <button id="sandboxUndoBtn" class="workspace-mini-btn ghost" type="button">Undo</button>
-                    <button id="sandboxApplyBtn" class="workspace-mini-btn" type="button">Apply Changes</button>
+                    <button id="sandboxSaveBtn" class="workspace-mini-btn ghost" type="button" title="Save file (Ctrl+S)">Save</button>
+                    <button id="sandboxDeleteBtn" class="workspace-mini-btn ghost" type="button" title="Delete file">Delete</button>
+                    <button id="sandboxUndoBtn" class="workspace-mini-btn ghost" type="button" title="Undo last change">Undo</button>
+                    <button id="sandboxApplyBtn" class="workspace-mini-btn" type="button" title="Apply all AI changes">Apply Changes</button>
                   </div>
                 </div>
               </div>
@@ -373,15 +329,18 @@
               </section>
             </section>
           </section>
-          <aside class="sandbox-chat-shell">
+          <aside class="sandbox-chat-shell" id="sandboxChatShell">
             <div class="workspace-panel-head sandbox-chat-head">
               <div class="workspace-panel-title">Requests</div>
               <div class="workspace-panel-hint">
                 Ask ROK for a code task.
               </div>
               <div class="workspace-panel-actions">
-                <button id="sandboxAnalyzeBtn" class="workspace-mini-btn ghost" type="button" hidden>Analyze</button>
-                <button id="sandboxClearAnalysisBtn" class="workspace-mini-btn ghost" type="button" hidden>Clear</button>
+                <button id="sandboxCollapseChatBtn" class="workspace-mini-btn ghost" type="button" title="Toggle requests panel (Ctrl+Shift+C)" aria-expanded="true" aria-controls="sandboxChatList">
+                  <span class="collapse-icon">▶</span>
+                </button>
+                <button id="sandboxAnalyzeBtn" class="workspace-mini-btn ghost" type="button" hidden title="Analyze current file">Analyze</button>
+                <button id="sandboxClearAnalysisBtn" class="workspace-mini-btn ghost" type="button" hidden title="Clear chat history">Clear</button>
               </div>
             </div>
             <div id="sandboxChatList" class="sandbox-chat-list" aria-live="polite">

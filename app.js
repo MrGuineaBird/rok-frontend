@@ -35,6 +35,11 @@ const sandboxAnalyzeBtn = document.getElementById("sandboxAnalyzeBtn");
 const sandboxUndoBtn = document.getElementById("sandboxUndoBtn");
 const sandboxApplyBtn = document.getElementById("sandboxApplyBtn");
 const sandboxClearAnalysisBtn = document.getElementById("sandboxClearAnalysisBtn");
+const sandboxCollapseFilesBtn = document.getElementById("sandboxCollapseFilesBtn");
+const sandboxCollapseChatBtn = document.getElementById("sandboxCollapseChatBtn");
+const sandboxFilesShell = document.getElementById("sandboxFilesShell");
+const sandboxChatShell = document.getElementById("sandboxChatShell");
+const sandboxPanel = document.getElementById("sandboxPanel");
 const sandboxFilePathInput = document.getElementById("sandboxFilePathInput");
 const sandboxFileEditor = document.getElementById("sandboxFileEditor");
 const sandboxChangesSummary = document.getElementById("sandboxChangesSummary");
@@ -6185,6 +6190,9 @@ function normalizeSandboxAnalysis(rawAnalysis) {
     summary: typeof rawAnalysis.summary === "string" && rawAnalysis.summary.trim()
       ? rawAnalysis.summary.trim()
       : fallback.summary,
+    message: typeof rawAnalysis.message === "string" && rawAnalysis.message.trim()
+      ? rawAnalysis.message.trim()
+      : "",
     setupSteps: rawSetupSteps
       .map((item) => String(item || "").trim())
       .filter(Boolean)
@@ -6762,6 +6770,7 @@ function completeSandboxActivity(analysis, sandbox = getCurrentSandboxState()) {
     ]),
     selectedPath: (current && current.selectedPath) || (selectedFile ? selectedFile.path : ""),
     summary: normalized.summary || "",
+    message: normalized.message || "",
     errorMessage: "",
     planFiles: normalized.files
   });
@@ -16133,6 +16142,69 @@ if (sandboxUploadFolderBtn && sandboxFolderInput) {
   });
   sandboxFolderInput.addEventListener("change", (e) => addSelectedSandboxFiles(e.target.files));
 }
+
+// --- Sandbox panel collapse functionality ---
+if (sandboxCollapseFilesBtn && sandboxFilesShell && sandboxPanel) {
+  sandboxCollapseFilesBtn.addEventListener("click", () => {
+    sandboxFilesShell.classList.toggle("is-collapsed");
+    sandboxPanel.classList.toggle("files-collapsed");
+    const isCollapsed = sandboxFilesShell.classList.contains("is-collapsed");
+    sandboxCollapseFilesBtn.setAttribute("aria-expanded", !isCollapsed);
+  });
+}
+
+if (sandboxCollapseChatBtn && sandboxChatShell && sandboxPanel) {
+  sandboxCollapseChatBtn.addEventListener("click", () => {
+    sandboxChatShell.classList.toggle("is-collapsed");
+    sandboxPanel.classList.toggle("chat-collapsed");
+    const isCollapsed = sandboxChatShell.classList.contains("is-collapsed");
+    sandboxCollapseChatBtn.setAttribute("aria-expanded", !isCollapsed);
+  });
+}
+
+// --- Keyboard shortcuts for sandbox ---
+document.addEventListener("keydown", (e) => {
+  // Only trigger when not in input fields (except specific cases)
+  const isInputFocused = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName);
+  
+  // Ctrl+S: Save file
+  if (e.ctrlKey && e.key === "s" && !e.shiftKey) {
+    e.preventDefault();
+    if (sandboxSaveBtn && !sandboxSaveBtn.disabled) {
+      sandboxSaveBtn.click();
+    }
+  }
+  
+  // Ctrl+N: New file (only when not in textarea)
+  if (e.ctrlKey && e.key === "n" && !isInputFocused) {
+    e.preventDefault();
+    if (sandboxNewFileBtn && !sandboxNewFileBtn.disabled) {
+      sandboxNewFileBtn.click();
+    }
+  }
+  
+  // Ctrl+B: Toggle file explorer
+  if (e.ctrlKey && e.key === "b" && !isInputFocused) {
+    e.preventDefault();
+    if (sandboxCollapseFilesBtn) {
+      sandboxCollapseFilesBtn.click();
+    }
+  }
+  
+  // Ctrl+Shift+C: Toggle chat panel
+  if (e.ctrlKey && e.shiftKey && e.key === "C" && !isInputFocused) {
+    e.preventDefault();
+    if (sandboxCollapseChatBtn) {
+      sandboxCollapseChatBtn.click();
+    }
+  }
+  
+  // Ctrl+Z: Undo (only when in file editor and not composing)
+  if (e.ctrlKey && e.key === "z" && !e.shiftKey && document.activeElement === sandboxFileEditor) {
+    // Allow browser's native undo in textarea
+    // Could add custom undo logic here if needed
+  }
+});
 
 // --- Sandbox drag-and-drop folder/file support ---
 if (sandboxPanel) {

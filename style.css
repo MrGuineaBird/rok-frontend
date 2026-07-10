@@ -2339,10 +2339,54 @@ a.server-down-btn {
   display: grid;
   grid-template-columns: minmax(190px, 230px) minmax(0, 1fr) minmax(300px, 360px);
   gap: 10px;
+  transition: grid-template-columns 0.3s ease;
 }
 
 .sandbox-shell[hidden] {
   display: none;
+}
+
+.sandbox-shell.files-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr) minmax(300px, 360px);
+}
+
+.sandbox-shell.chat-collapsed {
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr) 40px;
+}
+
+.sandbox-shell.files-collapsed.chat-collapsed {
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
+}
+
+.sandbox-files-shell.is-collapsed .sandbox-files-list,
+.sandbox-chat-shell.is-collapsed .sandbox-chat-list,
+.sandbox-chat-shell.is-collapsed .sandbox-chat-compose {
+  display: none;
+}
+
+.sandbox-files-shell.is-collapsed .workspace-panel-title,
+.sandbox-chat-shell.is-collapsed .workspace-panel-title,
+.sandbox-chat-shell.is-collapsed .workspace-panel-hint {
+  display: none;
+}
+
+.sandbox-files-shell.is-collapsed .workspace-panel-head,
+.sandbox-chat-shell.is-collapsed .workspace-panel-head {
+  justify-content: center;
+  padding: 8px;
+}
+
+.collapse-icon {
+  font-size: 12px;
+  transition: transform 0.2s ease;
+}
+
+.sandbox-files-shell.is-collapsed .collapse-icon {
+  transform: rotate(180deg);
+}
+
+.sandbox-chat-shell.is-collapsed .collapse-icon {
+  transform: rotate(180deg);
 }
 
 .sandbox-files-shell,
@@ -2388,6 +2432,7 @@ a.server-down-btn {
   display: grid;
   gap: 4px;
   cursor: pointer;
+  transition: all 0.15s ease;
 }
 
 .sandbox-file-btn:disabled {
@@ -2395,9 +2440,10 @@ a.server-down-btn {
   cursor: wait;
 }
 
-.sandbox-file-btn:hover {
+.sandbox-file-btn:hover:not(:disabled) {
   border-color: #402222;
   background: rgba(30, 13, 13, 0.76);
+  transform: translateX(2px);
 }
 
 .sandbox-file-btn.is-active {
@@ -2405,6 +2451,11 @@ a.server-down-btn {
   border-left-color: #B04949;
   background: rgba(209, 75, 75, 0.12);
   box-shadow: inset 0 0 0 1px rgba(176, 73, 73, 0.16);
+}
+
+.sandbox-file-btn:focus-visible {
+  outline: 2px solid #B04949;
+  outline-offset: -2px;
 }
 
 .sandbox-file-path {
@@ -2538,15 +2589,33 @@ a.server-down-btn {
   padding: 10px;
   display: grid;
   gap: 10px;
+  transition: all 0.3s ease;
+}
+
+.sandbox-activity-shell:not([hidden]) {
+  animation: activityShellPulse 2s ease-in-out infinite;
+}
+
+@keyframes activityShellPulse {
+  0%, 100% {
+    border-color: #432121;
+  }
+  50% {
+    border-color: #B04949;
+  }
 }
 
 .sandbox-activity-shell[data-state="success"] {
   border-color: rgba(85, 160, 104, 0.56);
+  animation: none;
+  background: linear-gradient(180deg, rgba(28, 40, 20, 0.82) 0%, rgba(12, 32, 16, 0.92) 100%);
 }
 
 .sandbox-activity-shell[data-state="error"],
 .sandbox-activity-shell[data-state="stopped"] {
   border-color: rgba(176, 73, 73, 0.56);
+  animation: none;
+  background: linear-gradient(180deg, rgba(40, 12, 12, 0.82) 0%, rgba(32, 12, 16, 0.92) 100%);
 }
 
 .sandbox-activity-head {
@@ -3297,10 +3366,11 @@ a.server-down-btn {
 
 .rok-home-cta {
   min-width: 220px;
+  min-height: 52px;
 }
 
 .rok-home-secondary-btn {
-  min-width: 180px;
+  min-width: 220px;
   min-height: 52px;
   padding: 14px 22px;
   border-radius: 999px;
