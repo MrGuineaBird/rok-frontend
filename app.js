@@ -1269,15 +1269,16 @@ function extractTokenFromStreamPayload(payload) {
       ? parsed.daedalus_quota
       : null;
   const web_tool = parsed.web_tool && typeof parsed.web_tool === "object" ? parsed.web_tool : null;
+  const agent_loop = parsed.agent_loop && typeof parsed.agent_loop === "object" ? parsed.agent_loop : null;
   for (const key of ["token", "response", "reply", "text", "message", "content"]) {
     const value = parsed[key];
     if (typeof value === "string") {
-      return { token: value, thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool };
+      return { token: value, thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool, agent_loop };
     }
   }
 
   if (parsed.message && typeof parsed.message === "object" && typeof parsed.message.content === "string") {
-    return { token: parsed.message.content, thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool };
+    return { token: parsed.message.content, thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool, agent_loop };
   }
 
   if (Array.isArray(parsed.choices)) {
@@ -1301,14 +1302,60 @@ function extractTokenFromStreamPayload(payload) {
       }
     }
     if (joined) {
-      return { token: joined, thinking, status, work, done: done || choiceDone, tool_calls, assistant_content, daedalus_quota, web_tool };
+      return { token: joined, thinking, status, work, done: done || choiceDone, tool_calls, assistant_content, daedalus_quota, web_tool, agent_loop };
     }
     if (done || choiceDone) {
-      return { token: "", thinking: "", status, work, done: true, tool_calls: null, assistant_content: "", daedalus_quota, web_tool };
+      return { token: "", thinking: "", status, work, done: true, tool_calls: null, assistant_content: "", daedalus_quota, web_tool, agent_loop };
     }
   }
 
-  return { token: "", thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool };
+  return { token: "", thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool, agent_loop };
+}
+
+function handleAgentLoopEvent(agentLoopEvent) {
+  if (!agentLoopEvent || typeof agentLoopEvent !== "object") return;
+  
+  const phase = agentLoopEvent.phase;
+  
+  switch (phase) {
+    case "tool_start":
+      const toolName = agentLoopEvent.tool_name || "unknown tool";
+      handleStatusUpdate(`Running ${toolName.replace(/_/g, " ")}`);
+      appendWorkTraceStep(`Starting ${toolName.replace(/_/g, " ")}`, {
+        detail: JSON.stringify(agentLoopEvent.tool_arguments || {})
+      });
+      break;
+      
+    case "tool_complete":
+      const completedTool = agentLoopEvent.tool_name || "unknown tool";
+      const success = agentLoopEvent.success;
+      handleStatusUpdate(success 
+        ? `Completed ${completedTool.replace(/_/g, " ")}` 
+        : `Tool ${completedTool.replace(/_/g, " ")} failed`);
+      if (!success && agentLoopEvent.error) {
+        appendWorkTraceStep(`Tool error: ${completedTool.replace(/_/g, " ")}`, {
+          detail: agentLoopEvent.error
+        });
+      }
+      break;
+      
+    case "iteration_complete":
+      const iteration = agentLoopEvent.iteration || 0;
+      handleStatusUpdate(`Iteration ${iteration} complete`);
+      break;
+      
+    case "done":
+      const reason = agentLoopEvent.reason || "completed";
+      const totalIterations = agentLoopEvent.total_iterations || 0;
+      handleStatusUpdate(`Agent loop finished (${reason}) after ${totalIterations} iterations`);
+      break;
+      
+    case "error":
+      const error = agentLoopEvent.error || "Unknown error";
+      handleStatusUpdate(`Agent loop error: ${error}`);
+      appendWorkTraceStep(`Agent loop error`, { detail: error });
+      break;
+  }
 }
 
 function splitThinkingFromText(text = "") {
@@ -1478,6 +1525,9 @@ async function readChatTextResponse(response, options = {}) {
       if (parsedPayload.token) {
         appendToken(parsedPayload.token);
       }
+      if (parsedPayload.agent_loop) {
+        handleAgentLoopEvent(parsedPayload.agent_loop);
+      }
       if (parsedPayload.done) {
         streamEnded = true;
         return;
@@ -1502,6 +1552,9 @@ async function readChatTextResponse(response, options = {}) {
       }
       if (parsedPayload.token) {
         appendToken(parsedPayload.token);
+      }
+      if (parsedPayload.agent_loop) {
+        handleAgentLoopEvent(parsedPayload.agent_loop);
       }
       if (parsedPayload.done) {
         streamEnded = true;
@@ -15131,6 +15184,7 @@ async function send() {
                     if (fParsed.tool_calls) { handleToolCalls(fParsed.tool_calls, fParsed.assistant_content); }
                     if (fParsed.token) { consumeTaggedTokenChunk(fParsed.token); }
                     if (fParsed.status) { handleStatusUpdate(fParsed.status); }
+                    if (fParsed.agent_loop) { handleAgentLoopEvent(fParsed.agent_loop); }
                   }
                 }
               }
@@ -15149,6 +15203,7 @@ async function send() {
                   if (fParsed.tool_calls) { handleToolCalls(fParsed.tool_calls, fParsed.assistant_content); }
                   if (fParsed.token) { consumeTaggedTokenChunk(fParsed.token); }
                   if (fParsed.status) { handleStatusUpdate(fParsed.status); }
+                  if (fParsed.agent_loop) { handleAgentLoopEvent(fParsed.agent_loop); }
                 }
               }
             }
@@ -15280,6 +15335,9 @@ async function send() {
           }
           if (parsedPayload.token) {
             consumeTaggedTokenChunk(parsedPayload.token);
+          }
+          if (parsedPayload.agent_loop) {
+            handleAgentLoopEvent(parsedPayload.agent_loop);
           }
         }
       }

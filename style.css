@@ -11847,12 +11847,155 @@ button.stop-mode:hover {
 
 /* Cleaner ROK CODE and Customize surfaces */
 .sandbox-shell {
-  grid-template-columns: minmax(220px, 260px) minmax(0, 1fr) minmax(300px, 360px);
-  gap: 0;
+  grid-template-columns: 200px minmax(0, 1fr) 280px;
+  gap: 1px;
   border: 1px solid rgba(95, 112, 132, 0.28);
   border-radius: 8px;
   background: #070b10;
   overflow: hidden;
+}
+
+/* Minimalistic ROK CODE */
+.sandbox-files-header {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid rgba(95, 112, 132, 0.2);
+  background: #0d131b;
+}
+
+.sandbox-toggle-btn {
+  background: transparent;
+  border: none;
+  color: #93a1b1;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.sandbox-toggle-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #dbe5ef;
+}
+
+.sandbox-icon-btn {
+  background: transparent;
+  border: 1px solid rgba(111, 126, 145, 0.35);
+  color: #dbe5ef;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 6px;
+  min-width: 32px;
+}
+
+.sandbox-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(111, 126, 145, 0.5);
+}
+
+.sandbox-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(95, 112, 132, 0.2);
+  background: #0d131b;
+}
+
+.sandbox-file-path-input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(111, 126, 145, 0.35);
+  border-radius: 6px;
+  color: #dbe5ef;
+  padding: 6px 10px;
+  font-size: 12px;
+  outline: none;
+}
+
+.sandbox-file-path-input:focus {
+  border-color: rgba(209, 75, 75, 0.45);
+}
+
+.sandbox-editor-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sandbox-activity {
+  padding: 8px 12px;
+  background: rgba(209, 75, 75, 0.08);
+  border-bottom: 1px solid rgba(209, 75, 75, 0.2);
+  font-size: 12px;
+  color: #e8a0a0;
+}
+
+.sandbox-chat-header {
+  padding: 12px;
+  border-bottom: 1px solid rgba(95, 112, 132, 0.2);
+  background: #0d131b;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.sandbox-chat-compose {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid rgba(95, 112, 132, 0.2);
+  background: #0d131b;
+}
+
+.sandbox-chat-input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(111, 126, 145, 0.35);
+  border-radius: 6px;
+  color: #dbe5ef;
+  padding: 8px 10px;
+  font-size: 13px;
+  resize: none;
+  min-height: 36px;
+  max-height: 120px;
+  outline: none;
+}
+
+.sandbox-chat-input:focus {
+  border-color: rgba(209, 75, 75, 0.45);
+}
+
+.sandbox-send-btn {
+  background: rgba(209, 75, 75, 0.18);
+  border: 1px solid rgba(209, 75, 75, 0.45);
+  color: #e8a0a0;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 12px;
+  border-radius: 6px;
+  min-width: 40px;
+}
+
+.sandbox-send-btn:hover {
+  background: rgba(209, 75, 75, 0.28);
+}
+
+.sandbox-file-editor {
+  border: none;
+  background: #0b1118;
+  color: #dbe5ef;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 12px;
+  resize: none;
+  outline: none;
+}
+
+.sandbox-files-list {
+  padding: 8px;
+  gap: 4px;
 }
 
 .sandbox-files-shell,

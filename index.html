@@ -257,42 +257,15 @@
         </div>
         <section id="sandboxPanel" class="sandbox-shell" hidden aria-live="polite">
           <aside class="sandbox-files-shell" id="sandboxFilesShell">
-            <div class="workspace-panel-head sandbox-files-head">
-              <div class="workspace-panel-title">Explorer</div>
-              <div class="workspace-panel-hint">Files</div>
-              <div class="workspace-panel-actions">
-                <button id="sandboxCollapseFilesBtn" class="workspace-mini-btn ghost" type="button" title="Toggle file explorer (Ctrl+B)" aria-expanded="true" aria-controls="sandboxFilesList">
-                  <span class="collapse-icon">◀</span>
-                </button>
-                <button id="sandboxUploadBtn" class="workspace-mini-btn ghost" type="button" title="Upload files">Upload</button>
-                <button id="sandboxUploadFolderBtn" class="workspace-mini-btn ghost" type="button" title="Upload folder">Folder</button>
-                <button id="sandboxNewFileBtn" class="workspace-mini-btn ghost" type="button" title="Create new file (Ctrl+N)">New File</button>
-              </div>
+            <div class="sandbox-files-header">
+              <button id="sandboxCollapseFilesBtn" class="sandbox-toggle-btn" type="button" title="Toggle files">◀</button>
+              <button id="sandboxNewFileBtn" class="sandbox-icon-btn" type="button" title="New file">+</button>
+              <button id="sandboxUploadBtn" class="sandbox-icon-btn" type="button" title="Upload">↑</button>
             </div>
             <div id="sandboxFilesList" class="sandbox-files-list"></div>
           </aside>
           <section class="sandbox-main-shell">
-            <div class="workspace-panel-head">
-              <div id="sandboxCurrentFileLabel" class="workspace-panel-title">No file selected</div>
-              <div class="workspace-panel-hint">
-                Edit files, review proposed changes, then apply when ready.
-              </div>
-              <div class="workspace-panel-tools">
-                <div class="workspace-panel-stats" aria-live="polite">
-                  <span id="sandboxFileCount" class="workspace-doc-chip">0 files</span>
-                  <span id="sandboxChangeCount" class="workspace-doc-chip">No AI changes</span>
-                  <span id="sandboxStatusChip" class="workspace-doc-chip" data-tone="idle">Idle</span>
-                </div>
-                  <div class="workspace-panel-actions">
-                    <button id="sandboxSaveBtn" class="workspace-mini-btn ghost" type="button" title="Save file (Ctrl+S)">Save</button>
-                    <button id="sandboxDeleteBtn" class="workspace-mini-btn ghost" type="button" title="Delete file">Delete</button>
-                    <button id="sandboxUndoBtn" class="workspace-mini-btn ghost" type="button" title="Undo last change">Undo</button>
-                    <button id="sandboxApplyBtn" class="workspace-mini-btn" type="button" title="Apply all AI changes">Apply Changes</button>
-                  </div>
-                </div>
-              </div>
-            <section class="sandbox-editor-shell">
-              <label class="sandbox-field-label" for="sandboxFilePathInput">Path</label>
+            <div class="sandbox-editor-header">
               <input
                 id="sandboxFilePathInput"
                 class="sandbox-file-path-input"
@@ -301,61 +274,33 @@
                 spellcheck="false"
                 autocomplete="off"
               />
-              <section id="sandboxActivityShell" class="sandbox-activity-shell" hidden aria-live="polite">
-                <div class="sandbox-activity-head">
-                  <div>
-                    <div id="sandboxActivityTitle" class="workspace-panel-title">ROK is working</div>
-                    <div id="sandboxActivityStatus" class="workspace-panel-hint">Reading files...</div>
-                  </div>
-                  <span id="sandboxActivityElapsed" class="workspace-doc-chip">0s</span>
-                </div>
-                <div id="sandboxActivityList" class="sandbox-activity-list"></div>
-              </section>
-              <textarea
-                id="sandboxFileEditor"
-                class="sandbox-file-editor"
-                placeholder="Select a file or create one to start editing."
-                spellcheck="false"
-              ></textarea>
-              <section class="sandbox-changes-shell" aria-live="polite">
-                <div class="sandbox-changes-head">
-                  <div class="workspace-panel-title">Requested Changes</div>
-                  <div id="sandboxChangesSummary" class="workspace-panel-hint">No AI file changes yet.</div>
-                </div>
-                <div id="sandboxChangesList" class="sandbox-changes-list">
-                  <div class="sandbox-empty-state">No file changes yet.</div>
-                </div>
-                <div id="sandboxChangesMeta" class="sandbox-setup-note" hidden></div>
-              </section>
-            </section>
-          </section>
-          <aside class="sandbox-chat-shell" id="sandboxChatShell">
-            <div class="workspace-panel-head sandbox-chat-head">
-              <div class="workspace-panel-title">Requests</div>
-              <div class="workspace-panel-hint">
-                Ask ROK for a code task.
-              </div>
-              <div class="workspace-panel-actions">
-                <button id="sandboxCollapseChatBtn" class="workspace-mini-btn ghost" type="button" title="Toggle requests panel (Ctrl+Shift+C)" aria-expanded="true" aria-controls="sandboxChatList">
-                  <span class="collapse-icon">▶</span>
-                </button>
-                <button id="sandboxAnalyzeBtn" class="workspace-mini-btn ghost" type="button" hidden title="Analyze current file">Analyze</button>
-                <button id="sandboxClearAnalysisBtn" class="workspace-mini-btn ghost" type="button" hidden title="Clear chat history">Clear</button>
+              <div class="sandbox-editor-actions">
+                <button id="sandboxSaveBtn" class="sandbox-icon-btn" type="button" title="Save">💾</button>
+                <button id="sandboxApplyBtn" class="sandbox-icon-btn" type="button" title="Apply changes">✓</button>
               </div>
             </div>
-            <div id="sandboxChatList" class="sandbox-chat-list" aria-live="polite">
-              <div class="sandbox-empty-state">Ask ROK to build or edit something.</div>
+            <div id="sandboxActivityShell" class="sandbox-activity" hidden>
+              <span id="sandboxActivityStatus">ROK is working...</span>
+            </div>
+            <textarea
+              id="sandboxFileEditor"
+              class="sandbox-file-editor"
+              placeholder="Select a file or create one to start editing."
+              spellcheck="false"
+            ></textarea>
+          </section>
+          <aside class="sandbox-chat-shell" id="sandboxChatShell">
+            <div class="sandbox-chat-header">
+              <button id="sandboxCollapseChatBtn" class="sandbox-toggle-btn" type="button" title="Toggle chat">▶</button>
             </div>
             <div class="sandbox-chat-compose">
               <textarea
                 id="sandboxChatInput"
                 class="sandbox-chat-input"
-                placeholder="Describe a code task."
+                placeholder="Ask ROK to edit code..."
                 spellcheck="true"
               ></textarea>
-              <div class="sandbox-chat-compose-actions">
-                <button id="sandboxChatSendBtn" class="workspace-mini-btn" type="button">Send</button>
-              </div>
+              <button id="sandboxChatSendBtn" class="sandbox-send-btn" type="button">→</button>
             </div>
           </aside>
         </section>
@@ -797,6 +742,6 @@ Change Scope: Short</p>
       window.ROK_API_BASE = isLocalHost ? "" : "https://rokapi.rokteam.org";
     })();
   </script>
-<script type="module" src="app.js?v=allgames75"></script>
+<script type="module" src="app.js?v=allgames74"></script>
 </body>
 </html>
