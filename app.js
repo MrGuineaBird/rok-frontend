@@ -8757,7 +8757,9 @@ function getIntentRoutingSystemPrompt(intent) {
     coding_debugging: [
       "Act like a practical coding assistant. Identify the likely cause, make or propose the concrete fix first, then explain briefly.",
       "Prefer patches, commands, tests, exact file/function references, and concise reasoning over lecture-mode explanation.",
-      "Do not call tools for coding requests. Do not generate images or diagrams unless explicitly requested. Output working code directly."
+      "When creating or modifying project files, use list_files, read_file, write_file, and edit_file instead of dumping large files inline.",
+      "Use write_file for new files and edit_file for targeted changes to existing files. Read files before editing them.",
+      "Do not generate images or diagrams unless explicitly requested."
     ],
     cybersecurity: [
       "Act as a defensive cybersecurity reviewer. Prioritize vulnerability analysis, secure code review, threat modeling, auth/session/CORS/rate-limit issues, SSRF/XSS/SQLi/path traversal, and safe exploit explanation.",
@@ -8812,10 +8814,22 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
     "Only call a tool when it is strictly required. Never use a tool as a substitute for writing the actual answer.",
     "If you can answer directly in text or code, do that instead of calling a tool."
   ];
-  if (codingRequest || !toolNames.length) {
+  if (codingRequest) {
     lines.push(
-      "This is a coding or build request. Answer with code or instructions directly.",
+      "This is a coding or build request. Use list_files to discover workspace files, read_file before editing, write_file for new files, and edit_file for surgical changes.",
       "Do NOT call generate_image, sketch_board, web_search, or web_fetch."
+    );
+  } else if (!toolNames.length) {
+    lines.push(
+      "Answer with text or code directly when no tools are available.",
+      "Do NOT call generate_image, sketch_board, web_search, or web_fetch."
+    );
+  }
+  const fileToolNames = ["list_files", "read_file", "write_file", "edit_file"];
+  if (fileToolNames.some((name) => toolNames.includes(name))) {
+    lines.push(
+      "Prefer write_file and edit_file over pasting full file contents in chat.",
+      "Use edit_file only when old_string appears exactly once in the target file."
     );
   }
   if (toolNames.includes("generate_image")) {
@@ -13505,7 +13519,7 @@ const BUILTIN_TOOLS = [
 function selectBuiltinToolsForRequest(text = "", intent = null) {
   if (!toolsEnabled) return [];
   if (requestLooksLikeCodingRequest(text, intent)) {
-    return [];
+    return [...FILE_TOOL_DEFINITIONS];
   }
   const selected = [...UTILITY_BUILTIN_TOOLS, ...FILE_TOOL_DEFINITIONS];
   if (requestLooksLikeExplicitImageGeneration(text)) {
