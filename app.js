@@ -1,5 +1,6 @@
-const chat = document.getElementById("chat");
-const workspaceTabs = document.getElementById("workspaceTabs");
+document.addEventListener('DOMContentLoaded', () => {
+  const chat = document.getElementById("chat");
+  const workspaceTabs = document.getElementById("workspaceTabs");
 const workspaceSidebarTabsSection = document.querySelector(".side-tabs-section");
 const workspaceSidebarTabs = document.getElementById("workspaceSidebarTabs");
 const workspacePanel = document.getElementById("workspacePanel");
@@ -21758,4 +21759,4 @@ async function handlePictionaryCommand() {
     }
   });
 }
-
+});
