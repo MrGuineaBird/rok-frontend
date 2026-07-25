@@ -13561,10 +13561,57 @@ function applyBuiltinToolsToRequestBody(requestBody, text = "", intent = null) {
   }
   requestBody.tools = selectedTools;
   applyToolChainingGuidanceToRequestBody(requestBody, { text, intent, selectedTools });
-  return selectedTools.map((tool) => String(tool.function && tool.function.name || "").trim()).filter(Boolean);
+  return selectedTools.map((tool) => normalizeBuiltinToolName(tool.function && tool.function.name)).filter(Boolean);
 }
 
 const BUILTIN_TOOL_MAX_LOOP = 5;
+const BUILTIN_TOOL_FOLLOWUP_MESSAGE = "Continue from the tool results above. Briefly confirm what you created or changed.";
+
+const BUILTIN_FILE_TOOL_NAMES = new Set(["list_files", "read_file", "write_file", "edit_file"]);
+
+function normalizeBuiltinToolName(name) {
+  const raw = String(name || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!raw) return "";
+  const base = raw.includes(".") ? raw.split(".").pop() : raw;
+  if (base === "write_file" || base === "writefile" || base === "create_file" || base === "file_write" || raw.endsWith("write_file")) {
+    return "write_file";
+  }
+  if (base === "read_file" || base === "readfile" || base === "file_read" || raw.endsWith("read_file")) {
+    return "read_file";
+  }
+  if (base === "edit_file" || base === "editfile" || base === "file_edit" || base === "patch_file" || raw.endsWith("edit_file")) {
+    return "edit_file";
+  }
+  if (base === "list_files" || base === "listfiles" || base === "file_list" || base === "ls" || raw.endsWith("list_files")) {
+    return "list_files";
+  }
+  return base;
+}
+
+function getNormalizedToolCallName(toolCall) {
+  const fn = toolCall && (toolCall.function || toolCall);
+  return normalizeBuiltinToolName((fn && fn.name) || toolCall.name || "");
+}
+
+function summarizeFileToolOutcomes(outcomes = []) {
+  const lines = [];
+  for (const outcome of outcomes) {
+    if (!outcome || !outcome.ok || !outcome.result) continue;
+    const name = normalizeBuiltinToolName(outcome.name);
+    if (name === "write_file") {
+      const action = outcome.result.created === false ? "Updated" : "Created";
+      lines.push(`${action} \`${outcome.result.path}\` (${outcome.result.lines || 0} lines).`);
+    } else if (name === "edit_file") {
+      lines.push(`Edited \`${outcome.result.path}\`.`);
+    } else if (name === "read_file") {
+      lines.push(`Read \`${outcome.result.path}\`.`);
+    } else if (name === "list_files") {
+      const count = Number(outcome.result.count) || 0;
+      lines.push(`Listed ${count} workspace file${count === 1 ? "" : "s"}.`);
+    }
+  }
+  return lines.join("\n");
+}
 
 function startGenerateImageTool(args = {}) {
   const prompt = normalizeImageToolPromptFragment(args.prompt || args.description || args.subject || "");
@@ -13597,13 +13644,14 @@ function startGenerateImageTool(args = {}) {
 }
 
 function executeBuiltinTool(name, args, context = {}) {
-  const guard = validateBuiltinToolExecution(name, context);
+  const normalizedName = normalizeBuiltinToolName(name);
+  const guard = validateBuiltinToolExecution(normalizedName, context);
   if (!guard.ok) {
     return { ok: false, error: guard.reason, skipped: true };
   }
   const a = args && typeof args === "object" ? args : {};
   try {
-    switch (name) {
+    switch (normalizedName) {
       case "calculator": {
         const expr = String(a.expression || "").replace(/[^0-9+\-*/().%^\s]|sqrt|abs|ceil|floor|round|sin|cos|tan|log|pi|e/gi, "");
         if (!expr.trim()) return { ok: false, error: "Empty expression." };
@@ -13724,7 +13772,7 @@ function executeBuiltinTool(name, args, context = {}) {
         return { ok: true, result: { path: editPath, replacements: 1, newLines: countLines(editFile.content) } };
       }
       default:
-        return { ok: false, error: `Unknown tool: ${name}` };
+        return { ok: false, error: `Unknown tool: ${normalizedName}` };
     }
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
@@ -14595,10 +14643,7 @@ async function send() {
       </div>
     `;
   };
-  const getToolCallName = (toolCall) => {
-    const fn = toolCall && (toolCall.function || toolCall);
-    return String((fn && fn.name) || "").trim().toLowerCase();
-  };
+  const getToolCallName = (toolCall) => getNormalizedToolCallName(toolCall);
   const isSlashToolDraft = (text) => {
     const trimmed = String(text || "").trim().toLowerCase();
     return (
@@ -15066,6 +15111,7 @@ async function send() {
       if (pendingToolCalls.length > 0 && toolsEnabled && allowedBuiltinToolNames.size) {
         let toolLoopCount = 0;
         let toolHistory = [...recentHistory];
+        const fileToolOutcomes = [];
         // Add the original user message to tool history if not already there
         if (!toolHistory.length || toolHistory[toolHistory.length - 1].role !== "user") {
           toolHistory.push({ role: "user", content: messageForApi });
@@ -15087,7 +15133,7 @@ async function send() {
             id: tc.id,
             type: "function",
             function: {
-              name: (tc.function && tc.function.name) || tc.name || "unknown",
+              name: getNormalizedToolCallName(tc) || "unknown",
               arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
             }
           }));
@@ -15095,7 +15141,7 @@ async function send() {
 
           // Execute each tool call and add results to history
           for (const tc of callsToExecute) {
-            const toolName = (tc.function && tc.function.name) || tc.name || "unknown";
+            const toolName = getNormalizedToolCallName(tc) || "unknown";
             let args = {};
             try {
               const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
@@ -15107,6 +15153,10 @@ async function send() {
             const resultContent = toolResult.ok
               ? JSON.stringify(toolResult.result)
               : JSON.stringify({ error: toolResult.error });
+
+            if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
+              fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+            }
 
             handleStatusUpdate(toolResult.ok
               ? `Ran ${toolName.replace(/_/g, " ")}`
@@ -15126,7 +15176,7 @@ async function send() {
           // Make follow-up request with tool results
           try {
             const followupBody = withLocalKnowledge({
-              message: "",
+              message: BUILTIN_TOOL_FOLLOWUP_MESSAGE,
               workspace_context: "",
               attachments: [],
               history: toolHistory,
@@ -15236,6 +15286,14 @@ async function send() {
           }
 
           // If more tool_calls were collected during the follow-up, the loop continues
+        }
+
+        if (!String(partialText || "").trim()) {
+          const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+          if (fallbackReply) {
+            partialText = fallbackReply;
+            noteAnswerStarted();
+          }
         }
 
         // After tool loop, finalize the text
@@ -15481,6 +15539,7 @@ async function send() {
     if (pendingToolCalls.length > 0 && toolsEnabled && allowedBuiltinToolNames.size) {
       let toolLoopCount = 0;
       let toolHistory = [...recentHistory];
+      const fileToolOutcomes = [];
       if (!toolHistory.length || toolHistory[toolHistory.length - 1].role !== "user") {
         toolHistory.push({ role: "user", content: messageForApi });
       }
@@ -15500,14 +15559,14 @@ async function send() {
           id: tc.id,
           type: "function",
           function: {
-            name: (tc.function && tc.function.name) || tc.name || "unknown",
+            name: getNormalizedToolCallName(tc) || "unknown",
             arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
           }
         }));
         toolHistory.push({ role: "assistant", content: assistantContent, tool_calls: toolCallsForHistory });
 
         for (const tc of callsToExecute) {
-          const toolName = (tc.function && tc.function.name) || tc.name || "unknown";
+          const toolName = getNormalizedToolCallName(tc) || "unknown";
           let args = {};
           try {
             const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
@@ -15519,6 +15578,10 @@ async function send() {
           const resultContent = toolResult.ok
             ? JSON.stringify(toolResult.result)
             : JSON.stringify({ error: toolResult.error });
+
+          if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
+            fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+          }
 
           handleStatusUpdate(toolResult.ok
             ? `Ran ${toolName.replace(/_/g, " ")}`
@@ -15537,7 +15600,7 @@ async function send() {
 
         try {
           const followupBody = withLocalKnowledge({
-            message: "",
+            message: BUILTIN_TOOL_FOLLOWUP_MESSAGE,
             workspace_context: "",
             attachments: [],
             history: toolHistory,
@@ -15628,6 +15691,14 @@ async function send() {
         } catch (fErr) {
           if (fErr && fErr.name !== "AbortError") console.log("Tool follow-up error:", fErr);
           break;
+        }
+      }
+
+      if (!String(partialText || "").trim()) {
+        const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+        if (fallbackReply) {
+          partialText = fallbackReply;
+          noteAnswerStarted();
         }
       }
 
