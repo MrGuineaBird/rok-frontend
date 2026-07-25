@@ -1312,52 +1312,6 @@ function extractTokenFromStreamPayload(payload) {
   return { token: "", thinking, status, work, done, tool_calls, assistant_content, daedalus_quota, web_tool, agent_loop };
 }
 
-function handleAgentLoopEvent(agentLoopEvent) {
-  if (!agentLoopEvent || typeof agentLoopEvent !== "object") return;
-  
-  const phase = agentLoopEvent.phase;
-  
-  switch (phase) {
-    case "tool_start":
-      const toolName = agentLoopEvent.tool_name || "unknown tool";
-      handleStatusUpdate(`Running ${toolName.replace(/_/g, " ")}`);
-      appendWorkTraceStep(`Starting ${toolName.replace(/_/g, " ")}`, {
-        detail: JSON.stringify(agentLoopEvent.tool_arguments || {})
-      });
-      break;
-      
-    case "tool_complete":
-      const completedTool = agentLoopEvent.tool_name || "unknown tool";
-      const success = agentLoopEvent.success;
-      handleStatusUpdate(success 
-        ? `Completed ${completedTool.replace(/_/g, " ")}` 
-        : `Tool ${completedTool.replace(/_/g, " ")} failed`);
-      if (!success && agentLoopEvent.error) {
-        appendWorkTraceStep(`Tool error: ${completedTool.replace(/_/g, " ")}`, {
-          detail: agentLoopEvent.error
-        });
-      }
-      break;
-      
-    case "iteration_complete":
-      const iteration = agentLoopEvent.iteration || 0;
-      handleStatusUpdate(`Iteration ${iteration} complete`);
-      break;
-      
-    case "done":
-      const reason = agentLoopEvent.reason || "completed";
-      const totalIterations = agentLoopEvent.total_iterations || 0;
-      handleStatusUpdate(`Agent loop finished (${reason}) after ${totalIterations} iterations`);
-      break;
-      
-    case "error":
-      const error = agentLoopEvent.error || "Unknown error";
-      handleStatusUpdate(`Agent loop error: ${error}`);
-      appendWorkTraceStep(`Agent loop error`, { detail: error });
-      break;
-  }
-}
-
 function splitThinkingFromText(text = "") {
   const value = String(text || "");
   if (!value.includes("<think>")) {
@@ -1526,7 +1480,8 @@ async function readChatTextResponse(response, options = {}) {
         appendToken(parsedPayload.token);
       }
       if (parsedPayload.agent_loop) {
-        handleAgentLoopEvent(parsedPayload.agent_loop);
+        // Agent loop events are handled in the main chat flow, not here
+        console.log("Agent loop event (readChatTextResponse):", parsedPayload.agent_loop);
       }
       if (parsedPayload.done) {
         streamEnded = true;
@@ -1554,7 +1509,8 @@ async function readChatTextResponse(response, options = {}) {
         appendToken(parsedPayload.token);
       }
       if (parsedPayload.agent_loop) {
-        handleAgentLoopEvent(parsedPayload.agent_loop);
+        // Agent loop events are handled in the main chat flow, not here
+        console.log("Agent loop event (readChatTextResponse):", parsedPayload.agent_loop);
       }
       if (parsedPayload.done) {
         streamEnded = true;
@@ -14430,6 +14386,51 @@ async function send() {
         detail: error || "The web tool request failed."
       });
       handleStatusUpdate(error || "Web tool request failed.");
+    }
+  };
+  const handleAgentLoopEvent = (agentLoopEvent) => {
+    if (!agentLoopEvent || typeof agentLoopEvent !== "object") return;
+    
+    const phase = agentLoopEvent.phase;
+    
+    switch (phase) {
+      case "tool_start":
+        const toolName = agentLoopEvent.tool_name || "unknown tool";
+        handleStatusUpdate(`Running ${toolName.replace(/_/g, " ")}`);
+        appendWorkTraceStep(`Starting ${toolName.replace(/_/g, " ")}`, {
+          detail: JSON.stringify(agentLoopEvent.tool_arguments || {})
+        });
+        break;
+        
+      case "tool_complete":
+        const completedTool = agentLoopEvent.tool_name || "unknown tool";
+        const success = agentLoopEvent.success;
+        handleStatusUpdate(success 
+          ? `Completed ${completedTool.replace(/_/g, " ")}` 
+          : `Tool ${completedTool.replace(/_/g, " ")} failed`);
+        if (!success && agentLoopEvent.error) {
+          appendWorkTraceStep(`Tool error: ${completedTool.replace(/_/g, " ")}`, {
+            detail: agentLoopEvent.error
+          });
+        }
+        break;
+        
+      case "iteration_complete":
+        const iteration = agentLoopEvent.iteration || 0;
+        handleStatusUpdate(`Iteration ${iteration} complete`);
+        break;
+        
+      case "done":
+        const reason = agentLoopEvent.reason || "completed";
+        const totalIterations = agentLoopEvent.total_iterations || 0;
+        handleStatusUpdate(`Agent loop finished (${reason}) after ${totalIterations} iterations`);
+        break;
+        
+      case "error":
+        const error = agentLoopEvent.error || "Unknown error";
+        handleStatusUpdate(`Agent loop error: ${error}`);
+        appendWorkTraceStep(`Agent loop error`, { detail: error });
+        break;
     }
   };
   const handleThinking = (chunk) => {
