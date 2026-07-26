@@ -8813,7 +8813,10 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
   const codingRequest = requestLooksLikeCodingRequest(text, intent);
   const lines = [
     "Only call a tool when it is strictly required. Never use a tool as a substitute for writing the actual answer.",
-    "If you can answer directly in text or code, do that instead of calling a tool."
+    "If you can answer directly in text or code, do that instead of calling a tool.",
+    "IMPORTANT: When calling tools, use the standard tool_calls format with 'tool_calls' array containing objects with 'id', 'type: function', and 'function' fields.",
+    "Do NOT output tool calls as JSON text in your message content. Use the structured tool_calls format instead.",
+    "Example tool call format: tool_calls: [{id: 'call_123', type: 'function', function: {name: 'write_file', arguments: '{\"path\": \"file.txt\", \"content\": \"...\"}'}}]"
   ];
   if (codingRequest) {
     lines.push(
