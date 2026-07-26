@@ -16993,7 +16993,7 @@ autoResizeInput();
 autoResizeSandboxChatInput();
 setComposerTrayOpen(false);
 setWebSearchEnabled(false);
-setToolsEnabled(false);
+setToolsEnabled(true);
 applyUserSettingsToRuntime();
 refreshMemoryToggleButtons();
 refreshSendState();
