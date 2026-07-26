@@ -8812,8 +8812,8 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
   const intent = context.intent || null;
   const codingRequest = requestLooksLikeCodingRequest(text, intent);
   const lines = [
-    "Only call a tool when it is strictly required. Never use a tool as a substitute for writing the actual answer.",
-    "If you can answer directly in text or code, do that instead of calling a tool.",
+    "When the user asks you to create, read, edit, or list files, you MUST use the file tools (list_files, read_file, write_file, edit_file).",
+    "Always use tools for file operations - do not just describe what you would do.",
     "IMPORTANT: When calling tools, use the standard tool_calls format with 'tool_calls' array containing objects with 'id', 'type: function', and 'function' fields.",
     "Do NOT output tool calls as JSON text in your message content. Use the structured tool_calls format instead.",
     "Example tool call format: tool_calls: [{id: 'call_123', type: 'function', function: {name: 'write_file', arguments: '{\"path\": \"file.txt\", \"content\": \"...\"}'}}]"
@@ -14774,6 +14774,7 @@ async function send() {
     return `Working on ${callNames.replace(/_/g, " ")}...`;
   };
   const handleToolCalls = (toolCalls, assistantContent) => {
+    console.log("handleToolCalls called with:", toolCalls, assistantContent);
     if (!Array.isArray(toolCalls) || !toolCalls.length) return;
     markAssistantStreamStarted();
     recordToolCallsInEvidence(assistantEvidence, toolCalls);
@@ -14786,6 +14787,7 @@ async function send() {
         ? String(tc.id)
         : `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const toolName = getToolCallName(tc);
+      console.log("Processing tool call:", toolName, "allowed:", allowedBuiltinToolNames.size, "has:", allowedBuiltinToolNames.has(toolName));
       if (allowedBuiltinToolNames.size && !allowedBuiltinToolNames.has(toolName)) {
         appendWorkTraceStep(`Ignored ${toolName.replace(/_/g, " ")}`, {
           detail: "That tool is not enabled for this request."
@@ -14794,6 +14796,7 @@ async function send() {
       }
       pendingToolCalls.push({ ...tc, id: toolCallId, _assistantContent: visibleAssistantContent });
     }
+    console.log("Pending tool calls after processing:", pendingToolCalls.length);
     handleStatusUpdate(getToolStatusText(toolCalls));
     // If the model also produced text content alongside tool calls, show it
     if (visibleAssistantContent.trim()) {
@@ -14922,6 +14925,18 @@ async function send() {
     let textChunk = thinkTagCarry + String(chunk || "");
     thinkTagCarry = "";
 
+    // Hide JSON tool calls that leaked into text content
+    if (textChunk.trim().startsWith("{") && textChunk.trim().endsWith("}")) {
+      try {
+        const parsed = JSON.parse(textChunk.trim());
+        if (parsed && typeof parsed === "object" && (parsed.cmd || parsed.tool || parsed.name)) {
+          // This looks like a leaked tool call, don't display it
+          return;
+        }
+      } catch (e) {
+        // Not valid JSON, display normally
+      }
+    }
     while (textChunk) {
       if (insideThinkTag) {
         const closeIndex = textChunk.indexOf(THINK_CLOSE_TAG);
