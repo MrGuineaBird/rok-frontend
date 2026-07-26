@@ -13601,6 +13601,82 @@ function getNormalizedToolCallName(toolCall) {
   return normalizeBuiltinToolName((fn && fn.name) || toolCall.name || "");
 }
 
+const LEAKED_TOOL_CALL_KEY_RE = /^[\{\[]\s*\{?\s*"(tool_calls|tool_call|function_call|function|tool|cmd|name)"\s*:/;
+
+function stripToolDraftFence(text) {
+  let trimmed = String(text || "").trim();
+  const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*(?:```)?$/i);
+  if (fenceMatch) {
+    trimmed = fenceMatch[1].trim();
+  }
+  return trimmed;
+}
+
+function mightBeLeakedToolCallDraft(text) {
+  const trimmed = stripToolDraftFence(text);
+  if (!trimmed) return false;
+  if (trimmed[0] !== "{" && trimmed[0] !== "[") return false;
+  if (LEAKED_TOOL_CALL_KEY_RE.test(trimmed)) return true;
+  // Not enough characters yet to know which key the JSON object starts with
+  return trimmed.length < 40 && /^[\{\[][\s\{"a-z_]*$/i.test(trimmed);
+}
+
+function normalizeLeakedToolCall(call) {
+  if (!call || typeof call !== "object") return null;
+  const fn = call.function && typeof call.function === "object" ? call.function : call;
+  const name = fn.name || call.tool || call.cmd || "";
+  if (!name || typeof name !== "string") return null;
+  let args = fn.arguments;
+  if (args === undefined) args = call.arguments;
+  if (args === undefined) args = call.params;
+  if (typeof args !== "string") {
+    try {
+      args = JSON.stringify(args || {});
+    } catch (_) {
+      args = "{}";
+    }
+  }
+  const normalized = { type: "function", function: { name: String(name), arguments: args } };
+  if (call.id) normalized.id = String(call.id);
+  return normalized;
+}
+
+function extractLeakedToolCalls(text) {
+  const trimmed = stripToolDraftFence(text);
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (_) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  let rawCalls = null;
+  if (Array.isArray(parsed)) {
+    rawCalls = parsed;
+  } else if (Array.isArray(parsed.tool_calls)) {
+    rawCalls = parsed.tool_calls;
+  } else if (parsed.tool_call && typeof parsed.tool_call === "object") {
+    rawCalls = [parsed.tool_call];
+  } else if (parsed.function_call && typeof parsed.function_call === "object") {
+    rawCalls = [parsed.function_call];
+  } else if (
+    parsed.function || parsed.tool || parsed.cmd ||
+    (typeof parsed.name === "string" && (parsed.arguments !== undefined || parsed.params !== undefined))
+  ) {
+    rawCalls = [parsed];
+  }
+  if (!Array.isArray(rawCalls) || !rawCalls.length) return null;
+  const toolCalls = rawCalls.map(normalizeLeakedToolCall).filter(Boolean);
+  if (!toolCalls.length || toolCalls.length !== rawCalls.length) return null;
+  let assistantContent = "";
+  if (!Array.isArray(parsed)) {
+    if (typeof parsed.content === "string") assistantContent = parsed.content;
+    else if (typeof parsed.assistant_content === "string") assistantContent = parsed.assistant_content;
+  }
+  return { toolCalls, assistantContent };
+}
+
 function summarizeFileToolOutcomes(outcomes = []) {
   const lines = [];
   for (const outcome of outcomes) {
@@ -14332,6 +14408,8 @@ async function send() {
   let answerStarted = false;
   let assistantStreamStarted = false;
   let pendingToolCalls = [];
+  let toolDraftBuffer = "";
+  let toolDraftBufferActive = false;
   let allowedBuiltinToolNames = new Set();
   let activeBuiltinToolContext = { userText: text, intent: fallbackIntent, allowedToolNames: allowedBuiltinToolNames };
   let webSearchVisualActive = false;
@@ -14759,6 +14837,7 @@ async function send() {
       ? toolCalls.map((toolCall) => getToolCallName(toolCall)).filter(Boolean)
       : [];
     if (!toolNames.length) return false;
+    if (extractLeakedToolCalls(trimmed)) return true;
     const onlyWebTools = toolNames.every((name) => name === "web_search" || name === "web_fetch");
     if (!onlyWebTools) return false;
     return isSlashToolDraft(trimmed) || isJsonToolDraft(trimmed);
@@ -14905,6 +14984,28 @@ async function send() {
   const handleAnswerToken = (token) => {
     const piece = String(token || "");
     if (!piece) return;
+    if (toolDraftBufferActive || (!partialText.trim() && mightBeLeakedToolCallDraft(toolDraftBuffer + piece))) {
+      toolDraftBufferActive = true;
+      toolDraftBuffer += piece;
+      const extracted = extractLeakedToolCalls(toolDraftBuffer);
+      if (extracted) {
+        toolDraftBuffer = "";
+        toolDraftBufferActive = false;
+        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
+        return;
+      }
+      if (!mightBeLeakedToolCallDraft(toolDraftBuffer)) {
+        const buffered = toolDraftBuffer;
+        toolDraftBuffer = "";
+        toolDraftBufferActive = false;
+        renderAnswerPiece(buffered);
+      }
+      return;
+    }
+    renderAnswerPiece(piece);
+  };
+  const renderAnswerPiece = (piece) => {
+    if (!piece) return;
     noteAnswerStarted();
     markAssistantStreamStarted();
     partialText += piece;
@@ -14925,16 +15026,13 @@ async function send() {
     let textChunk = thinkTagCarry + String(chunk || "");
     thinkTagCarry = "";
 
-    // Hide JSON tool calls that leaked into text content
-    if (textChunk.trim().startsWith("{") && textChunk.trim().endsWith("}")) {
-      try {
-        const parsed = JSON.parse(textChunk.trim());
-        if (parsed && typeof parsed === "object" && (parsed.cmd || parsed.tool || parsed.name)) {
-          // This looks like a leaked tool call, don't display it
-          return;
-        }
-      } catch (e) {
-        // Not valid JSON, display normally
+    // Route JSON tool calls that leaked into text content to the tool executor
+    const chunkTrimmed = textChunk.trim();
+    if (chunkTrimmed.startsWith("{") && chunkTrimmed.endsWith("}")) {
+      const extracted = extractLeakedToolCalls(chunkTrimmed);
+      if (extracted) {
+        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
+        return;
       }
     }
     while (textChunk) {
@@ -14974,13 +15072,27 @@ async function send() {
     }
   };
   const flushTaggedTokenCarry = () => {
-    if (!thinkTagCarry) return;
-    if (insideThinkTag) {
-      handleThinking(thinkTagCarry);
-    } else {
-      handleAnswerToken(thinkTagCarry);
+    if (thinkTagCarry) {
+      if (insideThinkTag) {
+        handleThinking(thinkTagCarry);
+      } else {
+        handleAnswerToken(thinkTagCarry);
+      }
+      thinkTagCarry = "";
     }
-    thinkTagCarry = "";
+    if (toolDraftBuffer) {
+      const buffered = toolDraftBuffer;
+      toolDraftBuffer = "";
+      toolDraftBufferActive = false;
+      const extracted = extractLeakedToolCalls(buffered);
+      if (extracted) {
+        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
+      } else {
+        renderAnswerPiece(buffered);
+      }
+    } else {
+      toolDraftBufferActive = false;
+    }
   };
   const initialFastStatus = getFastStartStatusForIntent(fallbackIntent, {
     imageAttachmentCount: initialImageAttachmentCount,
@@ -15211,7 +15323,13 @@ async function send() {
         handleThinking(separatedReply.thinking);
       }
       reply = separatedReply.answer || (separatedReply.thinking ? "" : reply);
-      partialText = reply || "(No response)";
+      const leakedFromReply = extractLeakedToolCalls(reply);
+      if (leakedFromReply && toolsEnabled && allowedBuiltinToolNames.size) {
+        handleToolCalls(leakedFromReply.toolCalls, leakedFromReply.assistantContent);
+        partialText = "";
+      } else {
+        partialText = reply || "(No response)";
+      }
       if (partialText) {
         noteAnswerStarted();
       }
@@ -15359,7 +15477,6 @@ async function send() {
                     const fParsed = extractTokenFromStreamPayload(fData);
                     if (fParsed.daedalus_quota) { applyDaedalusQuota(fParsed.daedalus_quota); }
                     if (fParsed.work) { handleWorkTraceEvent(fParsed.work); }
-                  if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.thinking) { handleThinking(fParsed.thinking); }
                     if (fParsed.tool_calls) { handleToolCalls(fParsed.tool_calls, fParsed.assistant_content); }
