@@ -13688,7 +13688,7 @@ function syncBackendFileToolResultToSandbox(name, args = {}, result = {}) {
   clearSandboxUndoSnapshot(sandbox);
   syncCurrentSessionFromHistory();
   loadSandboxDraftFromSelectedFile(true);
-  if (isSandboxSessionActive()) renderSandboxUI();
+  renderSandboxUI();
 }
 
 async function executeBackendFileTool(name, args = {}) {
