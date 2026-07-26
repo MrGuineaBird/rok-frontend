@@ -219,6 +219,7 @@ const ROK_API_BASE = isLocalBrowserHost()
 const buildApiUrl = (path) => `${ROK_API_BASE}${path}`;
 const API_URL = buildApiUrl("/api/chat");
 const SANDBOX_URL = buildApiUrl("/api/sandbox");
+const FILE_TOOLS_URL = buildApiUrl("/api/files");
 const INTENT_URL = buildApiUrl("/api/intent");
 const STATUS_URL = buildApiUrl("/api/status");
 const MODELS_URL = buildApiUrl("/api/models");
@@ -228,7 +229,7 @@ const BROWSER_PILOT_START_URL = buildApiUrl("/api/browser/start");
 const BROWSER_PILOT_AGENT_URL = buildApiUrl("/api/browser/agent");
 const BROWSER_PILOT_STOP_URL = buildApiUrl("/api/browser/stop");
 const BROWSER_PILOT_STATUS_URL = buildApiUrl("/api/browser/status");
-const BAN_GUARD_PATHS = new Set(["/api/chat", "/api/sandbox", "/api/intent", "/api/status", "/api/models"]);
+const BAN_GUARD_PATHS = new Set(["/api/chat", "/api/sandbox", "/api/files", "/api/intent", "/api/status", "/api/models"]);
 const DEFAULT_CLIENT_LIMITS = {
   typingSpeedMs: 12,
   cooldownMs: 1000,
@@ -13549,6 +13550,10 @@ function validateBuiltinToolExecution(name, context = {}) {
   if (toolName === "sketch_board" && !requestLooksLikeDiagramRequest(userText)) {
     return { ok: false, reason: "The user did not ask for a diagram or sketch board." };
   }
+  // Ensure sandbox is initialized for file tools
+  if (BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
+    getCurrentSandboxState();
+  }
   return { ok: true, reason: "" };
 }
 
@@ -13600,7 +13605,8 @@ function summarizeFileToolOutcomes(outcomes = []) {
     const name = normalizeBuiltinToolName(outcome.name);
     if (name === "write_file") {
       const action = outcome.result.created === false ? "Updated" : "Created";
-      lines.push(`${action} \`${outcome.result.path}\` (${outcome.result.lines || 0} lines).`);
+      const storageLabel = outcome.result.storage === "disk" ? " on disk" : " in browser storage";
+      lines.push(`${action} \`${outcome.result.path}\`${storageLabel} (${outcome.result.lines || 0} lines).`);
     } else if (name === "edit_file") {
       lines.push(`Edited \`${outcome.result.path}\`.`);
     } else if (name === "read_file") {
@@ -13643,13 +13649,99 @@ function startGenerateImageTool(args = {}) {
   };
 }
 
-function executeBuiltinTool(name, args, context = {}) {
+function syncBackendFileToolResultToSandbox(name, args = {}, result = {}) {
+  const normalizedName = normalizeBuiltinToolName(name);
+  const sandbox = getCurrentSandboxState();
+  const path = normalizeSandboxFilePath(result.path || args.path || "");
+  if (!path || !sandbox || !Array.isArray(sandbox.files)) return;
+  let changed = false;
+
+  if (normalizedName === "write_file") {
+    const content = String(args.content || "");
+    const existing = sandbox.files.find((f) => f.path.toLowerCase() === path.toLowerCase());
+    if (existing) {
+      existing.content = content;
+      existing.updatedAt = Date.now();
+    } else {
+      sandbox.files.push(createSandboxFile(path, content));
+    }
+    sandbox.selectedFileId = sandbox.files.find((f) => f.path.toLowerCase() === path.toLowerCase())?.id || sandbox.selectedFileId;
+    sandbox.statusText = `File saved to disk: ${path}`;
+    changed = true;
+  } else if (normalizedName === "edit_file" && typeof result.content === "string") {
+    const existing = sandbox.files.find((f) => f.path.toLowerCase() === path.toLowerCase());
+    if (existing) {
+      existing.content = result.content;
+      existing.updatedAt = Date.now();
+    } else {
+      sandbox.files.push(createSandboxFile(path, result.content));
+    }
+    sandbox.selectedFileId = sandbox.files.find((f) => f.path.toLowerCase() === path.toLowerCase())?.id || sandbox.selectedFileId;
+    sandbox.statusText = `File edited on disk: ${path}`;
+    changed = true;
+  }
+
+  if (!changed) return;
+  clearSandboxUndoSnapshot(sandbox);
+  syncCurrentSessionFromHistory();
+  loadSandboxDraftFromSelectedFile(true);
+  if (isSandboxSessionActive()) renderSandboxUI();
+}
+
+async function executeBackendFileTool(name, args = {}) {
+  const normalizedName = normalizeBuiltinToolName(name);
+  try {
+    const response = await fetchWithBanGuard(FILE_TOOLS_URL, {
+      method: "POST",
+      headers: buildApiHeaders(true, { modelId: sessionModel }),
+      body: JSON.stringify({
+        tool: normalizedName,
+        arguments: args && typeof args === "object" ? args : {}
+      })
+    });
+    const rawText = await safeReadResponseText(response);
+    let payload = null;
+    try {
+      payload = rawText ? JSON.parse(rawText) : null;
+    } catch (_) {
+      payload = null;
+    }
+    if (!response.ok || !payload || payload.ok === false) {
+      let errorText = payload && (payload.error || payload.message);
+      if (!errorText) errorText = rawText;
+      return {
+        ok: false,
+        error: errorText || `File tool request failed (${response.status || "unknown"}).`
+      };
+    }
+    const result = payload.result !== undefined ? payload.result : payload;
+    if (result && typeof result === "object" && !result.storage) {
+      result.storage = "disk";
+    }
+    syncBackendFileToolResultToSandbox(normalizedName, args, result);
+    return { ok: true, result };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `File tool backend is unavailable: ${error && error.message ? error.message : String(error)}`
+    };
+  }
+}
+
+async function executeBuiltinTool(name, args, context = {}) {
   const normalizedName = normalizeBuiltinToolName(name);
   const guard = validateBuiltinToolExecution(normalizedName, context);
   if (!guard.ok) {
     return { ok: false, error: guard.reason, skipped: true };
   }
   const a = args && typeof args === "object" ? args : {};
+  // Browser-only storage: skip backend file tool call
+  // if (BUILTIN_FILE_TOOL_NAMES.has(normalizedName)) {
+  //   const backendResult = await executeBackendFileTool(normalizedName, a);
+  //   if (backendResult.ok) {
+  //     return backendResult;
+  //   }
+  // }
   try {
     switch (normalizedName) {
       case "calculator": {
@@ -13710,7 +13802,7 @@ function executeBuiltinTool(name, args, context = {}) {
           lines: countLines(f.content),
           size: String(f.content || "").length
         }));
-        return { ok: true, result: { files, count: files.length } };
+        return { ok: true, result: { files, count: files.length, storage: "browser" } };
       }
       case "read_file": {
         const filePath = normalizeSandboxFilePath(a.path || "");
@@ -13727,7 +13819,7 @@ function executeBuiltinTool(name, args, context = {}) {
           const end = endLine > 0 ? Math.min(lines.length, endLine) : lines.length;
           content = lines.slice(start, end).join("\n");
         }
-        return { ok: true, result: { path: file.path, content, lines: countLines(content) } };
+        return { ok: true, result: { path: file.path, content, lines: countLines(content), storage: "browser" } };
       }
       case "write_file": {
         const writePath = normalizeSandboxFilePath(a.path || "");
@@ -13743,11 +13835,11 @@ function executeBuiltinTool(name, args, context = {}) {
         }
         sandbox.selectedFileId = sandbox.files.find((f) => f.path.toLowerCase() === writePath.toLowerCase())?.id || sandbox.selectedFileId;
         clearSandboxUndoSnapshot(sandbox);
-        sandbox.statusText = `File saved: ${writePath}`;
+        sandbox.statusText = `File saved in browser storage: ${writePath}`;
         syncCurrentSessionFromHistory();
         loadSandboxDraftFromSelectedFile(true);
         if (isSandboxSessionActive()) renderSandboxUI();
-        return { ok: true, result: { path: writePath, created: !existing, lines: countLines(writeContent) } };
+        return { ok: true, result: { path: writePath, created: !existing, lines: countLines(writeContent), storage: "browser" } };
       }
       case "edit_file": {
         const editPath = normalizeSandboxFilePath(a.path || "");
@@ -13765,11 +13857,11 @@ function executeBuiltinTool(name, args, context = {}) {
         editFile.content = fileContent.replace(oldStr, newStr);
         editFile.updatedAt = Date.now();
         clearSandboxUndoSnapshot(sandbox);
-        sandbox.statusText = `File edited: ${editPath}`;
+        sandbox.statusText = `File edited in browser storage: ${editPath}`;
         syncCurrentSessionFromHistory();
         loadSandboxDraftFromSelectedFile(true);
         if (isSandboxSessionActive()) renderSandboxUI();
-        return { ok: true, result: { path: editPath, replacements: 1, newLines: countLines(editFile.content) } };
+        return { ok: true, result: { path: editPath, replacements: 1, newLines: countLines(editFile.content), storage: "browser" } };
       }
       default:
         return { ok: false, error: `Unknown tool: ${normalizedName}` };
@@ -15148,7 +15240,7 @@ async function send() {
               args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
             } catch (_) { args = {}; }
 
-            const toolResult = executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+            const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
             const callId = tc.id;
             const resultContent = toolResult.ok
               ? JSON.stringify(toolResult.result)
@@ -15573,7 +15665,7 @@ async function send() {
             args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
           } catch (_) { args = {}; }
 
-          const toolResult = executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+          const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
           const callId = tc.id;
           const resultContent = toolResult.ok
             ? JSON.stringify(toolResult.result)
