@@ -499,6 +499,14 @@ const DEFAULT_DAEDALUS_LOCK_WINDOW_MS = 60 * 60 * 1000;
 const SANDBOX_DEFAULT_PROMPT = "Analyze and improve this code.";
 const SANDBOX_MAX_FILES = 48;
 const SANDBOX_MAX_FILE_CHARS = 24_000;
+
+// Local browser-storage fallback for /api/files when the backend is in
+// passthrough mode (ROK_FILE_TOOLS_MODE=client) OR unreachable (Render
+// without disk). Same caps as the sandbox so the user gets predictable
+// limits regardless of which surface they edit from.
+const LOCAL_FILE_TOOLS_KEY = "rok.localFileTools.v1";
+const LOCAL_FILE_TOOLS_MAX_FILES = SANDBOX_MAX_FILES;
+const LOCAL_FILE_TOOLS_MAX_FILE_CHARS = SANDBOX_MAX_FILE_CHARS;
 const SANDBOX_CHANGE_PREVIEW_CONTEXT_LINES = 2;
 const SANDBOX_CHANGE_PREVIEW_MAX_LINES = 24;
 const SANDBOX_STARTER_PROMPTS = {
@@ -14440,6 +14448,18 @@ async function executeBackendFileTool(name, args = {}) {
     if (!response.ok || !payload || payload.ok === false) {
       let errorText = payload && (payload.error || payload.message);
       if (!errorText) errorText = rawText;
+      // Backend refused with the local-only gate OR with the passthrough signal.
+      // Fall back to pure-client local storage so /agentic works on Render.
+      if (
+        (response.status === 403 && payload && payload.code === "file_tools_local_only")
+        || (payload && payload.code === "file_tools_passthrough")
+      ) {
+        const fallback = executeLocalFileTool(normalizedName, args);
+        if (fallback && fallback.ok) {
+          syncBackendFileToolResultToSandbox(normalizedName, args, fallback.result);
+        }
+        return fallback;
+      }
       return {
         ok: false,
         error: errorText || `File tool request failed (${response.status || "unknown"}).`
@@ -14449,14 +14469,273 @@ async function executeBackendFileTool(name, args = {}) {
     if (result && typeof result === "object" && !result.storage) {
       result.storage = "disk";
     }
+    // Backend is in passthrough mode (storage: "client") — persist locally
+    // and synthesize a matching result so the rest of the pipeline is happy.
+    if (result && result.passthrough === true) {
+      const clientResult = executeLocalFileToolFromPassthrough(normalizedName, args, result);
+      if (clientResult && clientResult.ok) {
+        syncBackendFileToolResultToSandbox(normalizedName, args, clientResult.result);
+        return clientResult;
+      }
+      return { ok: false, error: "Passthrough persistence failed." };
+    }
     syncBackendFileToolResultToSandbox(normalizedName, args, result);
     return { ok: true, result };
   } catch (error) {
+    // Network failure — try local fallback so /agentic still works offline / on Render.
+    const fallback = executeLocalFileTool(normalizedName, args);
+    if (fallback && fallback.ok) {
+      syncBackendFileToolResultToSandbox(normalizedName, args, fallback.result);
+      return fallback;
+    }
     return {
       ok: false,
       error: `File tool backend is unavailable: ${error && error.message ? error.message : String(error)}`
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// executeLocalFileTool — pure-client localStorage-backed file tool. Used when
+// the backend is in passthrough mode OR the network call failed OR the
+// backend's local-only gate 403'd. Mirrors the result shape produced by the
+// disk-backed backend so the rest of the agentic pipeline can stay unchanged.
+// ---------------------------------------------------------------------------
+function readLocalFileToolsStorage() {
+  try {
+    const raw = typeof localStorage !== "undefined"
+      ? localStorage.getItem(LOCAL_FILE_TOOLS_KEY)
+      : null;
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function writeLocalFileToolsStorage(map) {
+  try {
+    if (typeof localStorage === "undefined") return false;
+    localStorage.setItem(LOCAL_FILE_TOOLS_KEY, JSON.stringify(map || {}));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function normalizeLocalFileToolsKey(rawPath) {
+  const value = String(rawPath || "").replace(/\\/g, "/").trim();
+  if (!value || value.includes("\0") || value.length > 240) return "";
+  if (/^\/|^[A-Za-z]:/.test(value)) return "";
+  const parts = [];
+  for (const part of value.split("/")) {
+    const clean = part.trim();
+    if (!clean || clean === ".") continue;
+    if (clean === "..") return "";
+    parts.push(clean);
+  }
+  return parts.join("/");
+}
+
+function executeLocalFileTool(name, args = {}) {
+  const path = normalizeLocalFileToolsKey(args && args.path || "");
+  if (!path && name !== "list_files") {
+    return { ok: false, error: "Missing or unsafe file path." };
+  }
+  const store = readLocalFileToolsStorage();
+  const now = Date.now();
+
+  if (name === "list_files") {
+    const files = Object.keys(store)
+      .sort()
+      .slice(0, LOCAL_FILE_TOOLS_MAX_FILES)
+      .map((p) => ({
+        path: p,
+        size: (store[p] && store[p].bytes) || 0,
+        lines: (store[p] && store[p].lines) || 0
+      }));
+    return {
+      ok: true,
+      result: {
+        files,
+        count: files.length,
+        root: "browser",
+        storage: "client"
+      }
+    };
+  }
+
+  if (name === "read_file") {
+    const entry = store[path];
+    if (!entry) {
+      return { ok: false, error: `File not found: ${path}` };
+    }
+    let content = String(entry.content || "");
+    let truncated = false;
+    if (content.length > LOCAL_FILE_TOOLS_MAX_FILE_CHARS) {
+      content = content.slice(0, LOCAL_FILE_TOOLS_MAX_FILE_CHARS).trimEnd();
+      truncated = true;
+    }
+    const lines = content.length ? content.split(/\r\n|\r|\n/).length : 0;
+    return {
+      ok: true,
+      result: {
+        path,
+        content,
+        lines,
+        truncated,
+        storage: "client"
+      }
+    };
+  }
+
+  if (name === "write_file") {
+    const content = String((args && args.content) || "");
+    if (content.length > LOCAL_FILE_TOOLS_MAX_FILE_CHARS) {
+      return { ok: false, error: `File content is too large for ${path}.` };
+    }
+    const existing = Boolean(store[path]);
+    const keys = Object.keys(store);
+    if (!existing && keys.length >= LOCAL_FILE_TOOLS_MAX_FILES) {
+      return { ok: false, error: `Local file store is full (max ${LOCAL_FILE_TOOLS_MAX_FILES} files).` };
+    }
+    store[path] = {
+      content,
+      bytes: content.length,
+      lines: content.split(/\r\n|\r|\n/).length,
+      updatedAt: now
+    };
+    writeLocalFileToolsStorage(store);
+    return {
+      ok: true,
+      result: {
+        path,
+        created: !existing,
+        lines: store[path].lines,
+        bytes: store[path].bytes,
+        root: "browser",
+        storage: "client"
+      }
+    };
+  }
+
+  if (name === "edit_file") {
+    const existing = store[path];
+    if (!existing) {
+      return { ok: false, error: `File not found: ${path}` };
+    }
+    const oldString = String((args && args.old_string) || "");
+    const newString = String((args && args.new_string) || "");
+    if (!oldString) {
+      return { ok: false, error: "Missing old_string to find." };
+    }
+    let content = String(existing.content || "");
+    let occurrences = content.split(oldString).length - 1;
+    if (occurrences === 0 && oldString.trim()) {
+      const trimmed = oldString.trim();
+      occurrences = content.split(trimmed).length - 1;
+    }
+    if (occurrences === 0) {
+      return { ok: false, error: `old_string not found in ${path}` };
+    }
+    if (occurrences > 1) {
+      return { ok: false, error: `old_string appears ${occurrences} times in ${path}. Add more surrounding context to make it unique.` };
+    }
+    content = content.replace(oldString, newString);
+    if (content.length > LOCAL_FILE_TOOLS_MAX_FILE_CHARS) {
+      return { ok: false, error: `File content would exceed ${LOCAL_FILE_TOOLS_MAX_FILE_CHARS} chars.` };
+    }
+    store[path] = {
+      content,
+      bytes: content.length,
+      lines: content.split(/\r\n|\r|\n/).length,
+      updatedAt: now
+    };
+    writeLocalFileToolsStorage(store);
+    return {
+      ok: true,
+      result: {
+        path,
+        replacements: 1,
+        newLines: store[path].lines,
+        content,
+        storage: "client"
+      }
+    };
+  }
+
+  return { ok: false, error: `Unsupported file tool: ${name || "unknown"}` };
+}
+
+function executeLocalFileToolFromPassthrough(name, args, backendResult) {
+  // Backend already validated the request and supplied lines. Persist the
+  // content locally and surface a matching result so the agentic trace
+  // shows honest line counts + the ROK CODE file list gets refreshed.
+  if (!backendResult || typeof backendResult !== "object") {
+    return { ok: false, error: "Missing passthrough result." };
+  }
+  // Passthrough path only — if the backend ever returns a disk result here
+  // we should just trust it instead of re-applying the edit locally.
+  if (backendResult.storage && backendResult.storage !== "client") {
+    return { ok: true, result: backendResult };
+  }
+  const path = normalizeLocalFileToolsKey(backendResult.path || (args && args.path) || "");
+  if (!path && name !== "list_files") {
+    return { ok: false, error: "Missing or unsafe file path." };
+  }
+  const store = readLocalFileToolsStorage();
+  const now = Date.now();
+
+  if (name === "write_file") {
+    const content = String((args && args.content) || "");
+    store[path] = {
+      content,
+      bytes: content.length,
+      lines: content.split(/\r\n|\r|\n/).length,
+      updatedAt: now
+    };
+    writeLocalFileToolsStorage(store);
+    return {
+      ok: true,
+      result: {
+        path,
+        created: !backendResult.created ? false : true,
+        lines: backendResult.lines || store[path].lines,
+        bytes: backendResult.bytes || store[path].bytes,
+        root: "browser",
+        storage: "client"
+      }
+    };
+  }
+
+  if (name === "edit_file") {
+    // Persist the post-edit content (from args.new_string applied to local file)
+    const entry = store[path];
+    if (entry && args && typeof args.old_string === "string" && typeof args.new_string === "string") {
+      const content = String(entry.content || "").replace(args.old_string, args.new_string);
+      store[path] = {
+        content,
+        bytes: content.length,
+        lines: content.split(/\r\n|\r|\n/).length,
+        updatedAt: now
+      };
+      writeLocalFileToolsStorage(store);
+    }
+    return {
+      ok: true,
+      result: {
+        path,
+        replacements: 1,
+        newLines: backendResult.lines || (store[path] && store[path].lines) || 0,
+        content: (store[path] && store[path].content) || "",
+        storage: "client"
+      }
+    };
+  }
+
+  // For read_file/list_file, just return what the backend echoed.
+  return { ok: true, result: { ...backendResult, storage: "client" } };
 }
 
 async function executeBuiltinTool(name, args, context = {}) {
