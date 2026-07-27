@@ -11101,6 +11101,13 @@ function startNewSession(showNotice) {
     return;
   }
 
+  // Forget any in-flight agentic context so the first message in the new
+  // chat doesn't accidentally route into the agentic path via stale
+  // EDIT-FOLLOWUP heuristics.
+  if (typeof clearRecentAgenticContext === "function") {
+    try { clearRecentAgenticContext(); } catch (_) {}
+  }
+
   flushPendingWorkspaceSave();
   closeMobileSidebarIfNeeded();
   const next = createSession([]);
@@ -13149,13 +13156,20 @@ function createToolCallsPanel(initialSummary = "") {
     const doneCount = steps.filter((s) => s.status === "done").length;
     const errorCount = steps.filter((s) => s.status === "error").length;
     const skippedCount = steps.filter((s) => s.status === "skipped").length;
+    // Hide the "N steps" badge until at least one step has been added. Showing
+    // "0 steps" while the panel is still being initialized makes it look like
+    // a SECOND indicator stacked on top of the header label.
     if (steps.length === 0) {
-      count.textContent = "0 steps";
-    } else if (errorCount > 0 || skippedCount > 0) {
-      const tail = `${errorCount + skippedCount} failed`;
-      count.textContent = `${doneCount}/${steps.length} done (${tail})`;
+      count.hidden = true;
+      count.textContent = "";
     } else {
-      count.textContent = `${doneCount}/${steps.length} done`;
+      count.hidden = false;
+      if (errorCount > 0 || skippedCount > 0) {
+        const tail = `${errorCount + skippedCount} failed`;
+        count.textContent = `${doneCount}/${steps.length} done (${tail})`;
+      } else {
+        count.textContent = `${doneCount}/${steps.length} done`;
+      }
     }
   }
 
@@ -13296,335 +13310,6 @@ function renderToolCallsSummary(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// runAgenticTask — drives the tool-caller UI end-to-end for a user prompt.
-// Builds a plan of tool calls from the prompt, executes them locally via
-// executeBackendFileTool (or list_files when no path is given), updates each
-// step in the visible "Done" trace in real time, and stamps a summary line
-// like `Created `name.html` in browser storage (N lines).`
-//
-// Triggered by:  /agentic <prompt>   (in the composer)
-// ---------------------------------------------------------------------------
-const AGENTIC_DEFAULT_MODEL_ID =
-  (typeof HERMES_MODEL_ID === "string" && HERMES_MODEL_ID) || "gpt-oss:120b-cloud";
-
-function buildAgenticPlan(userText) {
-  const text = String(userText || "").trim();
-  const lower = text.toLowerCase();
-  const wantsCreate =
-    /\b(make|create|build|write|generate|code|implement|add)\b/.test(lower) ||
-    /\b(app|game|html|file|script|component|page|site|website|cli|bot)\b/.test(lower);
-  const wantsEdit = /\b(edit|change|update|modify|fix|refactor|patch)\b/.test(lower) && /\b(file|\.html|\.js|\.ts|\.css|\.py)\b/.test(lower);
-  const wantsList = /\b(list|show|what.?s in|find)\b/.test(lower) && /\b(file|folder|directory)\b/.test(lower);
-
-  // Pull a candidate filename out of the prompt.
-  const filenameMatch =
-    text.match(/[\w-]+\.(?:html|htm|js|ts|jsx|tsx|css|json|py|md|txt|csv|svg|java|c|cpp|h|hpp|sh|yml|yaml|toml|xml|sql)/i);
-  const filename = filenameMatch ? filenameMatch[0] : guessAgenticFilename(text);
-
-  const plan = [];
-  if (wantsList || wantsCreate) {
-    plan.push({
-      label: "Checking code",
-      meta: "list_files",
-      run: () => executeBackendFileTool("list_files", {})
-    });
-  }
-  plan.push({
-    label: "Generating response",
-    meta: "plan",
-    run: async () => ({ ok: true, result: { plan: "ready", steps: plan.length + 1 } }),
-    sleepMs: 350
-  });
-  if (filename && (wantsCreate || wantsEdit)) {
-    plan.push({
-      label: wantsEdit ? "Working on edit_file" : "Working on write file",
-      meta: filename,
-      run: async () => {
-        const content = generateAgenticFileContent(filename, text);
-        const args = { path: filename, content };
-        return executeBackendFileTool(wantsEdit ? "edit_file" : "write_file", args);
-      }
-    });
-    plan.push({
-      label: wantsEdit ? "Ran edit_file" : "Ran write file",
-      meta: filename,
-      run: async () => {
-        const args = { path: filename, content: "" };
-        return executeBackendFileTool(wantsEdit ? "edit_file" : "write_file", args);
-      },
-      skipRun: true
-    });
-  }
-  if (plan.length === 0) {
-    plan.push({
-      label: "Thinking",
-      meta: "",
-      run: async () => ({ ok: true, result: { echo: text } }),
-      sleepMs: 300
-    });
-    plan.push({
-      label: "Generating response",
-      meta: "",
-      run: async () => ({ ok: true, result: { reply: "Got it." } }),
-      sleepMs: 300
-    });
-  }
-  return plan;
-}
-
-function guessAgenticFilename(text) {
-  const lower = String(text || "").toLowerCase();
-  if (/\bflappy\b|\bbird\b/.test(lower)) return "flappy_bird.html";
-  if (/\bsnake\b/.test(lower)) return "snake.html";
-  if (/\btetris\b/.test(lower)) return "tetris.html";
-  if (/\b(website|web ?page|landing)\b/.test(lower)) return "index.html";
-  if (/\b(component|button|page|app)\b/.test(lower)) return "app.js";
-  return "agentic_output.html";
-}
-
-function generateAgenticFileContent(filename, userText) {
-  const ext = (filename.split(".").pop() || "").toLowerCase();
-  if (ext === "html" || ext === "htm") {
-    const title = filename.replace(/\.(html|htm)$/i, "");
-    // Minimal but real starter HTML so the demo always produces something visible.
-    const seed = String(userText || "").slice(0, 80) || title;
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>${escapeHtml(title)}</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #140A0A; color: #F2E9E9; font-family: "Sora", system-ui, sans-serif; }
-    main { padding: 24px 28px; border: 1px solid #2A1A1A; border-radius: 16px; background: #180D0D; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.4); max-width: 560px; }
-    h1 { margin: 0 0 8px; font-size: 22px; }
-    p { margin: 0; color: #BD9C9C; line-height: 1.55; }
-    .hint { margin-top: 12px; font-size: 12px; opacity: 0.7; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>${escapeHtml(title)}</h1>
-    <p>${escapeHtml(seed)}</p>
-    <div class="hint">Generated by the ROK agentic tool caller</div>
-  </main>
-</body>
-</html>
-`;
-  }
-  if (ext === "js" || ext === "ts") {
-    return `// ${filename}\n// Generated by the ROK agentic tool caller.\n// Original task: ${String(userText || "").replace(/\n/g, " ").slice(0, 120)}\n\nexport function run() {\n  return "Hello from ${filename}";\n}\n`;
-  }
-  if (ext === "css") {
-    return `/* ${filename} */\n:root { color-scheme: dark; }\nbody { margin: 0; font-family: "Sora", system-ui, sans-serif; background: #140A0A; color: #F2E9E9; }\n`;
-  }
-  if (ext === "json") {
-    return `{\n  "name": "${filename.replace(/\.json$/i, "")}",\n  "generatedBy": "ROK agentic tool caller"\n}\n`;
-  }
-  if (ext === "md") {
-    return `# ${filename.replace(/\.md$/i, "")}\n\nGenerated by the ROK agentic tool caller.\n\n> ${String(userText || "").replace(/\n/g, " ").slice(0, 160)}\n`;
-  }
-  if (ext === "py") {
-    return `# ${filename}\n# Generated by the ROK agentic tool caller.\n\ndef main():\n    return "Hello from ${filename}"\n\nif __name__ == "__main__":\n    print(main())\n`;
-  }
-  return `// ${filename}\n// Generated by the ROK agentic tool caller.\n// Original task: ${String(userText || "").replace(/\n/g, " ").slice(0, 120)}\n`;
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-async function runAgenticTask({ userText } = {}) {
-  const text = String(userText || "").trim();
-  if (!text) {
-    return { ok: false, error: "Empty prompt" };
-  }
-  if (typeof isSending !== "undefined" && isSending) {
-    return { ok: false, error: "Wait for the current ROK action to finish." };
-  }
-
-  // 1) Show the user message in the chat.
-  addMessage("user", text);
-
-  // 2) Build the tool-calls bubble (returns a controller via .toolController).
-  const traceMsg = addMessage("bot", "", {
-    toolTrace: true,
-    toolTraceSummary: ""
-  });
-  const controller = traceMsg && traceMsg.toolController;
-  controller.setHeader("Working");
-
-  // 3) Persist assistant placeholder + plan steps.
-  const plan = buildAgenticPlan(text);
-  const stepIds = [];
-  for (const item of plan) {
-    const id = controller.addStep({
-      label: item.label,
-      status: "pending",
-      meta: item.meta || ""
-    });
-    stepIds.push(id);
-  }
-
-  const results = [];
-  let summaryText = "";
-  let lastWriteInfo = null;
-  let writeStepFailed = false;
-
-  try {
-    for (let i = 0; i < plan.length; i++) {
-      const step = plan[i];
-      const id = stepIds[i];
-      controller.updateStep(id, { status: "running" });
-      scrollToBottom();
-      if (typeof step.sleepMs === "number" && step.sleepMs > 0) {
-        await new Promise((r) => setTimeout(r, step.sleepMs));
-      }
-      if (!step.skipRun) {
-        try {
-          const res = await step.run();
-          results.push(res);
-          if (res && res.ok === false) {
-            controller.updateStep(id, {
-              status: "error",
-              meta: res.error ? res.error.slice(0, 40) : "error"
-            });
-            if (/write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())) {
-              writeStepFailed = true;
-            }
-          } else {
-            controller.updateStep(id, { status: "done" });
-            if (
-              /write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())
-            ) {
-              const resultObj =
-                res && res.result && typeof res.result === "object" ? res.result : null;
-              if (resultObj) {
-                lastWriteInfo = {
-                  path: resultObj.path || step.meta,
-                  lines:
-                    typeof resultObj.newLines === "number"
-                      ? resultObj.newLines
-                      : typeof resultObj.lines === "number"
-                      ? resultObj.lines
-                      : null,
-                  content:
-                    (resultObj && typeof resultObj.content === "string" && resultObj.content) ||
-                    (step.label && step.run && typeof generateAgenticFileContent === "function"
-                      ? generateAgenticFileContent(step.meta || resultObj.path || "", text)
-                      : "")
-                };
-              }
-            }
-          }
-        } catch (e) {
-          results.push({ ok: false, error: String((e && e.message) || e) });
-          controller.updateStep(id, { status: "error", meta: "threw" });
-          if (/write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())) {
-            writeStepFailed = true;
-          }
-        }
-      } else {
-        // Post-write "Ran X" step: only mark done if the pre-step succeeded,
-        // otherwise mark as skipped so the panel doesn't falsely show success
-        // alongside an errored pre-step.
-        controller.updateStep(id, {
-          status: writeStepFailed ? "skipped" : "done"
-        });
-      }
-    }
-
-    controller.setHeader("Done");
-
-    // 4) Compose the summary line that lands under the trace.
-    const writeStep = plan.find((s) => /write|edit/i.test(s.label) && !/^ran\b/i.test(s.label));
-    const writePath =
-      (lastWriteInfo && lastWriteInfo.path) || (writeStep && writeStep.meta);
-    if (writePath) {
-      // Prefer server-reported line count, fall back to local content line count.
-      const writeResult = lastWriteInfo
-        ? results.find(
-            (r) =>
-              r &&
-              r.ok &&
-              r.result &&
-              r.result.path &&
-              String(r.result.path).endsWith(String(writePath))
-          )
-        : null;
-      const contentForCount =
-        (lastWriteInfo && lastWriteInfo.content) ||
-        (writeResult && writeResult.result && writeResult.result.content) ||
-        "";
-      const inferredLines =
-        (lastWriteInfo && typeof lastWriteInfo.lines === "number" && lastWriteInfo.lines) ||
-        countStringLines(contentForCount);
-      const safePath = String(writePath).trim();
-      const lineLabel = inferredLines > 0 ? ` (${inferredLines} lines)` : "";
-      // Only claim "Created ..." when the write actually succeeded —
-      // lastWriteInfo is only populated in the success branch, so its
-      // absence means the write_file / edit_file call failed (or the
-      // backend returned ok:false). Surface that honestly instead.
-      const writeSucceeded = Boolean(lastWriteInfo);
-      summaryText = writeSucceeded
-        ? `Created \`${safePath}\` in browser storage${lineLabel}.`
-        : `Couldn't create \`${safePath}\` \u2014 ${(writeResult && writeResult.error) || "file tool call failed"}.`;
-    } else {
-      // No write/edit step was attempted. If other steps errored, surface
-      // that honestly instead of claiming "Task finished."
-      const errorCount = (controller && controller.steps
-        ? controller.steps.filter((s) => s.node && s.node.dataset && s.node.dataset.status === "error").length
-        : 0);
-      if (errorCount > 0) {
-        const firstErr = controller.steps.find(
-          (s) => s.node && s.node.dataset && s.node.dataset.status === "error"
-        );
-        const errMeta = firstErr && firstErr.meta ? String(firstErr.meta).trim() : "";
-        summaryText = errMeta
-          ? (errorCount === 1
-              ? `1 tool error — ${errMeta}`
-              : `${errorCount} tool errors — ${errMeta}`)
-          : (errorCount === 1
-              ? "1 tool failed."
-              : `${errorCount} tools failed.`);
-      } else {
-        const finalReply =
-          (results[results.length - 1] &&
-            results[results.length - 1].result &&
-            (results[results.length - 1].result.reply ||
-              results[results.length - 1].result.message ||
-              results[results.length - 1].result.echo)) ||
-          "Task finished.";
-        summaryText = String(finalReply);
-      }
-    }
-    controller.setSummary(summaryText);
-
-    // 5) Persist the assistant message into history. We only persist the summary
-    // text — re-rendering after reload falls back to a plain bot bubble (the
-    // tool trace is in-flight only).
-    if (typeof history !== "undefined" && Array.isArray(history)) {
-      history.push({ role: "assistant", content: summaryText });
-      try {
-        syncCurrentSessionFromHistory && syncCurrentSessionFromHistory();
-      } catch (_) {
-      }
-    }
-
-    return { ok: true, summary: summaryText, results };
-  } catch (err) {
-    controller.setHeader("Stopped\u25BE");
-    controller.setSummary(`Agentic run stopped: ${(err && err.message) || err}`);
-    return { ok: false, error: err };
-  }
-}
-
-// ---------------------------------------------------------------------------
 // runAgenticCodeTask — real LLM-driven agentic coding.
 //
 // Replaces the previous stub behaviour (which echoed the user prompt into a
@@ -13649,91 +13334,153 @@ const AGENTIC_CODING_MODEL_FALLBACKS = [
   HERMES_MODEL_ID
 ].filter(Boolean);
 
+// Tracks the most recent successful agentic run so a short follow-up
+// message ("can you make it so the pipes are blue?", "change the colors",
+// "fix the bug", etc.) can be auto-routed back to runAgenticCodeTask with
+// edit semantics — instead of falling through to the regular chat path
+// where the LLM sometimes returns an empty "(No response)".
+// `files` is the array of paths written; `ts` is when the run finished.
+const ROK_LAST_AGENTIC_RUN = {
+  files: [],
+  primaryPath: "",
+  ts: 0
+};
+const AGENTIC_FOLLOWUP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+function hasRecentAgenticContext(now) {
+  if (!ROK_LAST_AGENTIC_RUN || !ROK_LAST_AGENTIC_RUN.ts) return null;
+  const ts = now || Date.now();
+  if (ts - ROK_LAST_AGENTIC_RUN.ts > AGENTIC_FOLLOWUP_WINDOW_MS) return null;
+  if (!Array.isArray(ROK_LAST_AGENTIC_RUN.files) || ROK_LAST_AGENTIC_RUN.files.length === 0) return null;
+  return {
+    files: ROK_LAST_AGENTIC_RUN.files.slice(),
+    primaryPath: ROK_LAST_AGENTIC_RUN.primaryPath || ROK_LAST_AGENTIC_RUN.files[0]
+  };
+}
+
+function safeRecentAgenticContext() {
+  return (typeof hasRecentAgenticContext === "function" ? hasRecentAgenticContext() : null) || null;
+}
+
+function clearRecentAgenticContext() {
+  if (!ROK_LAST_AGENTIC_RUN) return;
+  ROK_LAST_AGENTIC_RUN.files = [];
+  ROK_LAST_AGENTIC_RUN.primaryPath = "";
+  ROK_LAST_AGENTIC_RUN.ts = 0;
+}
+
+// Sanitize a path before interpolating into the agentic system prompt.
+// Defends against backtick/template injection if the model ever returns a
+// path containing those characters.
+function escapeAgenticPromptPath(rawPath) {
+  return String(rawPath || "")
+    .replace(/[`$]/g, (ch) => `\\${ch}`)
+    .replace(/[\r\n]+/g, " ")
+    .trim();
+}
+
 const AGENTIC_CODING_SYSTEM_PROMPT = [
-  "You are the ROK agentic coding helper. When the user asks you to create or modify code, follow these rules strictly:",
+  "You are the ROK agentic coding helper. You MUST use the provided native tool-calling API to create or modify files - never emit raw XML tags, markdown fences, or code blocks in your message content.",
   "",
-  "1. Briefly state (1-2 sentences) what you are about to build and which file(s) you will write.",
-  "2. Output each code file in EXACTLY this fenced tag format so the tool caller can persist it:",
+  "Workflow:",
+  "1. Read the user's request and identify which file(s) need to be created or modified.",
+  "2. If you need to inspect an existing file first (e.g. for an EDIT request), call read_file with its path; then call write_file or edit_file with the FULL updated content.",
+  "3. For a NEW file from scratch, call write_file once with `path` and the complete `content`. Do NOT abbreviate content with placeholders like '...' or 'rest of code'.",
+  "4. For an EDIT to an existing file, prefer edit_file (surgical old_string/new_string change). If the edit is large, use write_file with the COMPLETE updated content.",
+  "5. After all tool calls finish, you may add a 1-3 sentence plain-text reply summarizing what was built or changed. Do not emit code as text.",
   "",
-  "<rok_file path=\"filename.ext\">",
-  "<full file content, complete and runnable, no placeholders, no truncation>",
-  "</rok_file>",
+  "Tool selection cheat-sheet:",
+  "- list_files -> see what files exist in the workspace",
+  "- read_file -> fetch an existing file's content",
+  "- write_file -> create or fully overwrite a file (path + full content)",
+  "- edit_file -> small surgical change (path + old_string + new_string)",
   "",
-  "Repeat one <rok_file>...</rok_file> block per file. Multiple files are fine.",
-  "3. The file inside <rok_file> must be complete, copy-pasteable, and ready to run. Never abbreviate with '...' or 'rest of code'.",
-  "4. Pick sensible filenames that match the user's intent (e.g. index.html for HTML demos, app.js for JS, server.py for Python).",
-  "5. If an image, asset, or external library is needed, mention it in one short sentence after the file blocks - do NOT emit unrelated prose before the first rok_file tag.",
-  "6. After all files, you may add a short (1-3 sentence) summary of what was built and how to run it.",
-  "",
-  "If the user prompt is NOT a coding task, reply normally in plain text - do NOT wrap your reply in <rok_file> tags."
+  "Filenames: pick sensible default names matching the user's intent (e.g. flappy.html, index.html, app.js, server.py). Always include an extension. The `path` parameter is REQUIRED for all file tools."
 ].join("\n");
 
-const AGENTIC_ROK_FILE_RE = /<rok_file\b([^>]*)>([\s\S]*?)<\/rok_file>/gi;
-const AGENTIC_FENCE_RE = /```(?:html|htm|js|jsx|ts|tsx|css|json|py|python|md|csv|svg|sh|bash|java|c|cpp|cs|go|rs|rb|php|swift|kt|dart|lua|toml|yml|yaml|xml|sql|txt|plain)(?:\s+([\w./-]+\.[A-Za-z0-9]+))?\n([\s\S]*?)```/g;
-
-function parseAgenticCodeBlocks(text) {
-  const cleaned = String(text || "");
-  const files = [];
-  const seenPaths = new Set();
-
-  // 1) Prefer the explicit <rok_file path="..."> tag - it's deterministic
-  //    and survives even if the model also wraps content in fences.
-  AGENTIC_ROK_FILE_RE.lastIndex = 0;
-  let match;
-  while ((match = AGENTIC_ROK_FILE_RE.exec(cleaned)) !== null) {
-    const attrs = String(match[1] || "");
-    const content = String(match[2] || "").trim();
-    if (!content) continue;
-    const pathMatch = attrs.match(/path\s*=\s*["']([^"']+)["']/);
-    const rawPath = pathMatch ? pathMatch[1] : "";
-    const path = normalizeAgenticFilePath(rawPath, cleaned) || guessAgenticFilename(cleaned);
-    if (!path) continue;
-    if (seenPaths.has(path)) continue;
-    seenPaths.add(path);
-    files.push({ path, content, source: "rok_file" });
+// Native Ollama tool definitions for the file workspace. Schema conforms to
+// https://docs.ollama.com/capabilities/tool-calling so the model emits
+// structured `message.tool_calls` instead of having to coerce to XML tags.
+const AGENTIC_TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "list_files",
+      description: "List all files currently stored in the user's ROK workspace (browser localStorage).",
+      parameters: { type: "object", properties: {}, required: [] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "Read the contents of an existing file in the workspace. Returns the file content or an error if the file does not exist.",
+      parameters: {
+        type: "object",
+        required: ["path"],
+        properties: {
+          path: {
+            type: "string",
+            description: "Workspace-relative file path including extension, e.g. 'flappy.html' or 'src/app.js'."
+          }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "Create a new file or completely overwrite an existing file with the supplied content. Use this for new files OR when an edit is large enough that a full rewrite is cleaner than a diff.",
+      parameters: {
+        type: "object",
+        required: ["path", "content"],
+        properties: {
+          path: {
+            type: "string",
+            description: "Workspace-relative file path including extension (e.g. 'flappy.html')."
+          },
+          content: {
+            type: "string",
+            description: "The complete file content. Must be runnable end-to-end with no placeholders or truncation."
+          }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description: "Apply a precise edit to an existing file. The `old_string` must appear EXACTLY once in the file (include enough surrounding context to make it unique). The tool replaces it with `new_string`.",
+      parameters: {
+        type: "object",
+        required: ["path", "old_string", "new_string"],
+        properties: {
+          path: {
+            type: "string",
+            description: "Workspace-relative file path."
+          },
+          old_string: {
+            type: "string",
+            description: "Exact text to find (must be unique in the file)."
+          },
+          new_string: {
+            type: "string",
+            description: "Replacement text."
+          }
+        }
+      }
+    }
   }
-  if (files.length) return files;
+];
 
-  // 2) Fall back to fenced ```lang blocks. If there's exactly one written
-  //    file worth of code, treat the strongest fence as the file.
-  AGENTIC_FENCE_RE.lastIndex = 0;
-  while ((match = AGENTIC_FENCE_RE.exec(cleaned)) !== null) {
-    const lang = String(match[1] || "").toLowerCase();
-    const explicitPath = String(match[2] || "").trim();
-    const content = String(match[3] || "").trim();
-    if (!content) continue;
-    // Skip tiny fences (likely illustrative snippets, not full files).
-    if (content.length < 80 && !explicitPath) continue;
-    const path = explicitPath || normalizeAgenticFilePath("", cleaned, lang) || guessAgenticFilename(cleaned);
-    if (!path || seenPaths.has(path)) continue;
-    seenPaths.add(path);
-    files.push({ path, content, source: "fence" });
-  }
-  return files;
-}
+// Hard cap on tool calls per agentic request. gpt-oss-120b-cloud has been
+// known to hallucinate 20+ identical write_file calls when confused; without
+// a cap each call lands in browser localStorage until quota blows up.
+const AGENTIC_MAX_TOOL_CALLS_PER_REQUEST = 12;
 
-function normalizeAgenticFilePath(rawPath, promptText, langHint) {
-  let candidate = String(rawPath || "").trim();
-  if (!candidate && langHint) {
-    const ext = langHint === "python" ? "py" : (langHint === "plain" ? "txt" : langHint);
-    return ""; // caller will derive
-  }
-  candidate = candidate.replace(/^["']+|["']+$/g, "").replace(/^[.\/]+/, "");
-  if (!candidate) return "";
-  // Disallow absolute paths and parent traversal.
-  if (/^[A-Za-z]:[\\/]/.test(candidate) || candidate.startsWith("/") || /(^|\/)\.\.(\/|$)/.test(candidate)) {
-    return "";
-  }
-  // Must contain an extension.
-  if (!/\.[A-Za-z0-9]{1,6}$/.test(candidate)) {
-    const ext = (langHint && langHint !== "plain") ? langHint : "txt";
-    candidate = `${candidate}.${ext === "python" ? "py" : ext}`;
-  }
-  if (candidate.length > 240) return "";
-  return candidate;
-}
-
-function looksLikeCodingRequest(text) {
+function looksLikeCodingRequest(text, recentContext) {
   const original = String(text || "");
   const t = original.toLowerCase().trim();
   if (!t || t.length < 6) return false;
@@ -13764,6 +13511,36 @@ function looksLikeCodingRequest(text) {
 
   // Natural "make me a <thing>" / "build a <thing>" with a code-shaped target.
   if (/\b(make|build|create|write|generate)\b[^.!?\n]{0,20}\bme\b[^.!?\n]{0,8}\ba [^.!?\n]{0,40}\b(game|app|website|web ?page|bot|form|calculator|simulator|todo|chat|tracker|timer|calendar|markdown|converter|parser|scraper|crawler|api|cli|tool|dashboard|mini-?game|widget|plugin|script|program|component|button|card|modal|theme|layout|website|portfolio|resume)\b/i.test(t)) {
+    return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // EDIT-FOLLOWUP ONLY — exclusively a follow-on-the-recent-file feature.
+  //
+  // The cold-session branch was removed because conversational edit forms
+  // ("can you make it work", "fix this") without any file context would
+  // fire and try to write an arbitrary file. Edit-followups are only
+  // meaningful in the context of a recent successful agentic run, so we
+  // gate the entire branch on `recentContext` being present.
+  // ---------------------------------------------------------------------
+  if (!recentContext || !recentContext.primaryPath) return false;
+
+  const editAction =
+    /\b(make|change|update|modify|fix|adjust|switch|set|toggle|rename|edit|remove|delete|add|tweak|optimize|refactor|rewrite|reword|resize|color|colour|recolor|recolour|restyle|reframe|retheme|convert|translate|port|wire|hook|filter|sort|group|merge|split|format|clean up|polish)\b/;
+  const pronounOrFileRef =
+    /\b(it|this|that|them|these|those|the (code|file|script|app|game|page|button|menu|sidebar|header|footer|colors|colours|theme|background|style|layout))\b|^\s*edit\s+/i;
+  const canYouForm = /\bcan (you|u|we)\b[^.!?\n]{0,20}\b(make|change|fix|update|add|remove|create|build|edit|rewrite)\b/i;
+  const editFollowup =
+    /\b(make it so|make them|make this (game|app|website|page) (work|look|feel|run|move|play|start|stop)|change (the|it|them) (to|from|into)|change (the|it|them) [^.!?\n]{0,40}\b(red|blue|green|black|white|yellow|purple|pink|orange|brown|gray|grey|big|small|larger|smaller|wider|taller|slower|faster|loud|quiet|dark|light|bright|dim|fancy|simple|cleaner|prettier|cute|cool)\b|toggle (the|it|them)|fix (the|it|this|that|them))\b/i;
+
+  // With recent agentic context, a short tweak almost certainly targets
+  // the file we just generated.
+  if (editAction.test(t) && (pronounOrFileRef.test(t) || editFollowup.test(t) || canYouForm.test(t))) {
+    return true;
+  }
+  // Even without a strong verb, very short follow-ups in the window are
+  // treated as edits — e.g. "the pipes should be bigger", "rename to red".
+  if (t.length < 80 && (editAction.test(t) || editFollowup.test(t) || canYouForm.test(t) || pronounOrFileRef.test(t))) {
     return true;
   }
 
@@ -13800,12 +13577,27 @@ function pickAgenticCodingModelId() {
   return unlocked[0];
 }
 
-async function runAgenticCodeTask({ userText } = {}) {
+// One-UI guard: while an agentic tool-caller run is in progress, the regular
+// chat-send handler MUST NOT add a parallel typing-dots bubble. Without this,
+// the chat shows the trace panel AND a separate "AI Checking code..." bubble
+// at the same time, which is the three-UI overlap reported in production.
+// Cleared in the finally block of runAgenticCodeTask so a stream error still
+// releases the flag.
+let ROK_AGENTIC_RUN_IN_FLIGHT = false;
+
+async function runAgenticCodeTask({ userText, recentContext } = {}) {
   const text = String(userText || "").trim();
   if (!text) return { ok: false, error: "Empty prompt" };
   if (typeof isSending !== "undefined" && isSending) {
     return { ok: false, error: "Wait for the current ROK action to finish." };
   }
+  // If the caller didn't supply a recent context but the helper exists,
+  // pull one lazily — covers cases where the auto-detect branch wasn't
+  // visited (e.g. /agentic slash command).
+  const ctx = recentContext || (
+    typeof safeRecentAgenticContext === "function" ? safeRecentAgenticContext() : null
+  );
+  ROK_AGENTIC_RUN_IN_FLIGHT = true;
 
   // 1) Echo the user message so the chat history stays consistent. We clear
   //    the input here (not in the caller) so that if anything downstream
@@ -13817,18 +13609,20 @@ async function runAgenticCodeTask({ userText } = {}) {
   }
   if (typeof autoResizeInput === "function") autoResizeInput();
 
-  // 2) Build the tool trace panel so the user sees checked steps (matches the
-  //    visual pattern of the original /agentic UI).
+  // 2) Build the tool trace panel — this is the ONE indicator the user sees
+  //    during an agentic run. We deliberately omit `toolTraceSummary` so the
+  //    panel's bottom line stays hidden until the run produces a final
+  //    result. The header (Working -> Done) and the step counts are the only
+  //    labels shown.
   const traceMsg = addMessage("bot", "", {
-    toolTrace: true,
-    toolTraceSummary: "ROK is generating code\u2026"
+    toolTrace: true
   });
   const controller = traceMsg && traceMsg.toolController;
   if (!controller) return { ok: false, error: "Failed to open tool trace panel." };
   controller.setHeader("Working");
   const idCall = controller.addStep({ label: "Calling ROK", status: "running", meta: pickAgenticCodingModelId() });
-  const idParse = controller.addStep({ label: "Parsing response", status: "pending", meta: "" });
-  const idWrite = controller.addStep({ label: "Writing files", status: "pending", meta: "" });
+  const idParse = controller.addStep({ label: "Collecting tool calls", status: "pending", meta: "" });
+  const idWrite = controller.addStep({ label: "Executing tools", status: "pending", meta: "" });
 
   if (typeof scrollToBottom === "function") scrollToBottom();
 
@@ -13843,7 +13637,30 @@ async function runAgenticCodeTask({ userText } = {}) {
   const messagePayload = (typeof buildMessageForApi === "function")
     ? String(buildMessageForApi(text, ""))
     : text;
-  let agenticSystemPrompt = AGENTIC_CODING_SYSTEM_PROMPT;
+  // If we're in EDIT-followup mode, prepend explicit context about which
+  // file was previously generated so the LLM treats the request as an edit.
+  // IMPORTANT: this MUST align with the new tool-only system prompt above —
+  // we used to tell the model to emit `<rok_file>` markup, but that scheme
+  // is exactly the one we just removed. Pointing the model at the native
+  // `edit_file` / `write_file` tools here keeps EDIT-followups consistent
+  // with cold-session creates.
+  let editContextLine = "";
+  if (ctx && (ctx.primaryPath || (ctx.files && ctx.files[0]))) {
+    const safePrimary = escapeAgenticPromptPath(ctx.primaryPath || ctx.files[0]);
+    const others = (ctx.files || [])
+      .filter((p) => p !== (ctx.primaryPath || ctx.files[0]))
+      .map(escapeAgenticPromptPath);
+    editContextLine =
+      `\n\nSession context: the user's most recently generated file in this session is ` +
+      `\`${safePrimary}\`` +
+      (others.length ? ` (also present: ${others.map((p) => "`" + p + "`").join(", ")})` : "") +
+      `. The current message is a followup edit — to modify \`${safePrimary}\`, ` +
+      `prefer the \`edit_file\` tool with a surgical \`old_string\`-to-\`new_string\` change; ` +
+      `for large rewrites use \`write_file\` with the COMPLETE updated content. ` +
+      `Always pass the \`path\` parameter set to \`${safePrimary}\`.`;
+  }
+
+  let agenticSystemPrompt = AGENTIC_CODING_SYSTEM_PROMPT + editContextLine;
   if (typeof getCustomPromptOverridesForApi === "function") {
     try {
       const overrides = getCustomPromptOverridesForApi();
@@ -13875,7 +13692,12 @@ async function runAgenticCodeTask({ userText } = {}) {
     max_tokens: (typeof clientLimits !== "undefined" && clientLimits && clientLimits.maxResponseTokens) || 8192,
     enable_thinking: false,
     custom_system_prompt: agenticSystemPrompt,
-    incognito: Boolean(typeof isIncognitoModeEnabled === "function" && isIncognitoModeEnabled())
+    incognito: Boolean(typeof isIncognitoModeEnabled === "function" && isIncognitoModeEnabled()),
+    // Native Ollama-style tool calling — see
+    // https://docs.ollama.com/capabilities/tool-calling. The cloud Hermes
+    // model was unreliable at the previous inline <rok_file> XML-tag scheme,
+    // and `gpt-oss-120b-cloud` follows structured tool_calls far more cleanly.
+    tools: AGENTIC_TOOL_DEFINITIONS
   };
   const requestBody = baseBody;
 
@@ -13891,6 +13713,8 @@ async function runAgenticCodeTask({ userText } = {}) {
   let fullText = "";
   let streamError = null;
   let lastSummaryUpdate = 0;
+  const toolCalls = [];
+  const toolCallsFingerprints = new Set();
   try {
     if (typeof activeRequestController !== "undefined") {
       activeRequestController = new AbortController();
@@ -13913,16 +13737,45 @@ async function runAgenticCodeTask({ userText } = {}) {
       if (!payloadStr || payloadStr === "[DONE]") return;
       let parsed;
       try { parsed = JSON.parse(payloadStr); } catch (_) { return; }
+      // Surface any thinking trace lightly so the model has a chance to think,
+      // but don't blow up the chat UI with it.
       if (parsed && typeof parsed.token === "string") {
         fullText += parsed.token;
         // Throttle DOM updates to ~4Hz so we don't thrash on long generations.
         const now = Date.now();
         if (now - lastSummaryUpdate > 250) {
           lastSummaryUpdate = now;
-          controller.setSummary(`ROK is generating code\u2026 ${fullText.length} chars`);
+          controller.setSummary(`ROK is reasoning\u2026 ${fullText.length} chars`);
         }
       }
-      // Ignore thinking traces / tool_calls / web_search / status / etc.
+      // Collect native Ollama-style tool_calls. Some wrappers emit them at
+      // top-level (parsed.tool_calls), others under message.tool_calls (raw
+      // upstream format). Accept both shapes; dedupe by a stable name+args
+      // fingerprint (full stringified args so we don't false-dedupe calls
+      // that only differ past column 80).
+      const rawCalls = Array.isArray(parsed?.tool_calls)
+        ? parsed.tool_calls
+        : (Array.isArray(parsed?.message?.tool_calls) ? parsed.message.tool_calls : null);
+      if (rawCalls && rawCalls.length) {
+        for (const tc of rawCalls) {
+          if (!tc || typeof tc !== "object") continue;
+          const fn = tc.function || {};
+          const name = String(fn.name || "").trim();
+          if (!name) continue;
+          let argsKey;
+          if (typeof fn.arguments === "string") {
+            argsKey = fn.arguments;
+          } else if (fn.arguments && typeof fn.arguments === "object") {
+            try { argsKey = JSON.stringify(fn.arguments); } catch (_) { argsKey = String(fn.arguments); }
+          } else {
+            argsKey = String(fn.arguments || "");
+          }
+          const fp = `${name}#${argsKey}`;
+          if (toolCallsFingerprints.has(fp)) continue;
+          toolCallsFingerprints.add(fp);
+          toolCalls.push(tc);
+        }
+      }
     };
 
     if (contentType.includes("text/event-stream")) {
@@ -13978,9 +13831,12 @@ async function runAgenticCodeTask({ userText } = {}) {
     }
     if (typeof autoResizeInput === "function") autoResizeInput();
   } finally {
-    // Always release the busy flag, even if we bailed out via the catch.
+    // Always release the busy flag and the one-UI guard, even if we bailed out
+  // via the catch. The guard must clear on every exit path so the next send
+  // doesn't see stale state.
     if (typeof isSending !== "undefined") isSending = wasSending;
     if (typeof refreshSendState === "function") refreshSendState();
+    ROK_AGENTIC_RUN_IN_FLIGHT = false;
   }
 
   controller.updateStep(idCall, {
@@ -13988,82 +13844,178 @@ async function runAgenticCodeTask({ userText } = {}) {
     meta: streamError ? String((streamError && streamError.message) || streamError).slice(0, 60) : `${fullText.length} chars`
   });
 
-  // 4) Parse the model's reply for code blocks.
-  controller.updateStep(idParse, { status: "running" });
-  const files = parseAgenticCodeBlocks(fullText);
+  // 4) Execute any native tool_calls the model emitted. Each tool call
+  //    becomes one step in the trace panel; the call itself routes through
+  //    executeBackendFileTool which POSTs to /api/files and falls back to
+  //    executeLocalFileTool (browser localStorage) on Render.
   controller.updateStep(idParse, {
-    status: "done",
-    meta: `${files.length} file${files.length === 1 ? "" : "s"}`
+    status: "running",
+    meta: `${toolCalls.length} tool call${toolCalls.length === 1 ? "" : "s"}`
   });
-
-  // 5) Persist each file via the existing file-tool pipeline. The backend
-  //    falls back to passthrough on Render, and the client code further falls
-  //    back to localStorage when the backend is unavailable, so files survive
-  //    server restarts.
   const written = [];
   const failed = [];
-  if (files.length > 0) {
-    controller.updateStep(idWrite, { status: "running", meta: files[0].path });
-    for (const file of files) {
+  if (toolCalls.length > 0) {
+    controller.updateStep(idWrite, { status: "running", meta: "" });
+    // Cap execution at AGENTIC_MAX_TOOL_CALLS_PER_REQUEST to protect browser
+    // localStorage from runaway model output. Overflow calls land in `failed`
+    // so the user sees the truncation in the summary.
+    const executeCap = Math.min(toolCalls.length, AGENTIC_MAX_TOOL_CALLS_PER_REQUEST);
+    if (toolCalls.length > executeCap) {
+      failed.push({
+        path: `(skipped \u00d7 ${toolCalls.length - executeCap})`,
+        error: `Capacity cap reached; only the first ${executeCap} tool calls were executed.`
+      });
+    }
+    for (let i = 0; i < executeCap; i++) {
+      const tc = toolCalls[i];
+      const fn = (tc && tc.function) || {};
+      const toolName = String(fn.name || "").trim();
+      // Ollama sometimes emits `arguments` as a JSON string, sometimes as an
+      // already-parsed object. Defensive-parse both shapes.
+      let args = {};
+      if (typeof fn.arguments === "string") {
+        try { args = JSON.parse(fn.arguments) || {}; } catch (_) { args = {}; }
+      } else if (fn.arguments && typeof fn.arguments === "object") {
+        args = fn.arguments;
+      }
+      const argPreview = args && args.path
+        ? String(args.path)
+        : (Object.keys(args).slice(0, 2).join(", ") || "(no args)");
+      const idTool = controller.addStep({
+        label: toolName === "write_file" ? "write_file"
+          : toolName === "edit_file" ? "edit_file"
+          : toolName === "read_file" ? "read_file"
+          : toolName === "list_files" ? "list_files"
+          : (toolName || "tool"),
+        status: "running",
+        meta: argPreview.slice(0, 60)
+      });
       try {
-        const result = await executeBackendFileTool("write_file", {
-          path: file.path,
-          content: file.content
-        });
+        const result = await executeBackendFileTool(toolName, args);
         if (result && result.ok) {
-          written.push({ path: file.path, lines: countStringLines(file.content) });
+          controller.updateStep(idTool, { status: "done", meta: (result.result && result.result.path) || argPreview });
+          if ((toolName === "write_file" || toolName === "edit_file") && args && args.path) {
+            written.push({
+              path: args.path,
+              lines: (result.result && (result.result.lines || result.result.newLines)) || 0
+            });
+          }
         } else {
-          failed.push({ path: file.path, error: (result && result.error) || "write failed" });
+          controller.updateStep(idTool, { status: "error", meta: ((result && result.error) || "tool call failed").slice(0, 60) });
+          if (args && args.path) {
+            failed.push({ path: args.path, error: (result && result.error) || "tool call failed" });
+          }
         }
       } catch (e) {
-        failed.push({ path: file.path, error: String((e && e.message) || e) });
+        controller.updateStep(idTool, { status: "error", meta: String((e && e.message) || e).slice(0, 60) });
+        if (args && args.path) {
+          failed.push({ path: args.path, error: String((e && e.message) || e) });
+        }
       }
     }
+    controller.updateStep(idParse, {
+      status: "done",
+      meta: `${executeCap}/${toolCalls.length} call${toolCalls.length === 1 ? "" : "s"}`
+    });
     controller.updateStep(idWrite, {
       status: failed.length === 0 ? "done" : (written.length === 0 ? "error" : "running"),
-      meta: written.length ? `${written.length}/${files.length} ok` : "all failed"
+      meta: written.length ? `${written.length}/${executeCap} ok` : "all failed"
     });
   } else {
-    controller.updateStep(idWrite, {
-      status: "error",
-      meta: "no code blocks found"
-    });
-  }
+    // Model returned no tool calls. Mark the parsing step as done (no-op) and
+    // fall back to surfacing any assistant text reply as a separate bot
+    // bubble so the user can still see what the model said.
+    controller.updateStep(idParse, { status: "done", meta: "no tool calls" });
+    controller.updateStep(idWrite, { status: "error", meta: "no tool calls" });
+    // Last-resort safety net: if the model ignored native tool calling and
+    // emitted <rok_file path="...">...</rok_file> markup in its prose
+    // (Hermes on gpt-oss-120b-cloud has been known to do this), pull the
+    // paths and content out and execute them via the same tool pipeline.
+    // Caps at AGENTIC_MAX_TOOL_CALLS_PER_REQUEST to keep localStorage safe.      if (fullText && /<rok_file\b/i.test(fullText)) {
+      const safeMarkupRe = /<rok_file\b([^>]*)>([\s\S]*?)<\/rok_file>/gi;
+      const seenSafetyFps = new Set();
+      let match;
+      let markupCount = 0;
+      while ((match = safeMarkupRe.exec(fullText)) !== null) {
+        if (markupCount >= AGENTIC_MAX_TOOL_CALLS_PER_REQUEST) break;
+        const attrs = String(match[1] || "");
+        const content = String(match[2] || "").trim();
+        if (!content) continue;
+        const pathMatch = attrs.match(/path\s*=\s*["']([^"']+)["']/);
+        const safePath = pathMatch ? pathMatch[1] : "";
+        // Strict path validation matching the contract that
+        // executeLocalFileTool → normalizeLocalFileToolsKey enforces downstream:
+        // no `..` segments, no leading `/`, no absolute paths, no control chars,
+        // no extension-less names. Defense in depth so a confused model can't
+        // try to escape the workspace via the markup fallback.
+        if (!safePath) continue;
+        if (safePath.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) continue;
+        if (!/^[A-Za-z0-9_./-]+$/.test(safePath)) continue;
+        if (!/\.[A-Za-z0-9]{1,6}$/.test(safePath)) continue;
+        // Dedupe: identical (path, content-prefix) tuples only execute once.
+        const fp = `${safePath}#${content.length}#${content.slice(0, 200)}`;
+        if (seenSafetyFps.has(fp)) continue;
+        seenSafetyFps.add(fp);
+        const idSafety = controller.addStep({
+          label: "write_file",
+          status: "running",
+          meta: safePath.slice(0, 80)
+        });
+        try {
+          const result = await executeBackendFileTool("write_file", { path: safePath, content });
+          if (result && result.ok) {
+            controller.updateStep(idSafety, { status: "done", meta: safePath });
+            written.push({ path: safePath, lines: countStringLines(content) });
+          } else {
+            controller.updateStep(idSafety, { status: "error", meta: ((result && result.error) || "fallback write failed").slice(0, 60) });
+            failed.push({ path: safePath, error: (result && result.error) || "fallback write failed" });
+          }
+        } catch (e) {
+          controller.updateStep(idSafety, { status: "error", meta: String((e && e.message) || e).slice(0, 60) });
+        }
+        markupCount++;
+      }
+      if (written.length > 0) {
+        controller.updateStep(idWrite, {
+          status: failed.length === 0 ? "done" : (written.length === 0 ? "error" : "running"),          meta: "fallback wrote " + written.length
+        });
+      }
+    }
 
-  // 6) Compose the summary so the chat stays accurate. If parsing failed or
-  //    the LLM had nothing useful to say, surface the raw reply as a normal
-  //    bot message so the user can read what the model actually produced
-  //    (and re-prompt with better instructions).
+  // 5) Compose the summary line that lands under the trace.
+  //    No-tool-calls replies fold the assistant's prose INTO the summary so
+  //    the chat shows ONE bubble (the trace panel) plus the user message
+  //    above it. Cap the prose at 280 chars so a runaway response can't
+  //    explode the trace summary line.
   let summaryText;
-  let showRawReply = false;
   if (written.length === 0 && failed.length === 0 && streamError) {
     summaryText = `Couldn't reach ROK: ${(streamError && streamError.message) || streamError}`;
   } else if (written.length === 0 && failed.length > 0) {
     summaryText = `Couldn't write files - ${failed[0].error}`;
-  } else if (written.length === 0 && files.length === 0) {
-    summaryText = "No code blocks found in the reply. Showing ROK's answer below.";
-    showRawReply = true;
+  } else if (written.length === 0 && toolCalls.length === 0) {
+    const prose = fullText.replace(/\s+/g, " ").trim().slice(0, 280);
+    summaryText = prose
+      ? `No tool calls in ROK's reply: "${prose}${fullText.length > 280 ? "\u2026" : ""}"`
+      : "No tool calls in ROK's reply.";
   } else {
     summaryText =
       `Created ${written.map((w) => "`" + w.path + "`").join(", ")} in browser storage` +
-      (written.length && written[0].lines ? ` (${written[0].lines} lines)` : "") +
       (failed.length ? ` - ${failed.length} failed` : "");
   }
   controller.setSummary(summaryText);
   controller.setHeader(streamError && written.length === 0 ? "Stopped" : "Done");
 
-  if (showRawReply && fullText.trim() && typeof addMessage === "function") {
-    try {
-      addMessage("bot", fullText, { markdown: true });
-    } catch (_) {
-      // Best-effort: if markdown rendering fails, fall back to plain text.
-      try { addMessage("bot", fullText); } catch (_) { /* ignore */ }
-    }
+  // 6) Remember what we just wrote so the next user message in this chat
+  //    can be auto-routed back here as an EDIT-followup instead of falling
+  //    through to the regular chat path.
+  if (written.length > 0) {
+    ROK_LAST_AGENTIC_RUN.files = written.map((w) => w.path);
+    ROK_LAST_AGENTIC_RUN.primaryPath = written[0].path;
+    ROK_LAST_AGENTIC_RUN.ts = Date.now();
   }
 
-  // 7) Push a minimal assistant marker into history so reload shows the trace
-  //    in the chat. We persist just the summary; the per-step trace is
-  //    ephemeral by design.
+  // 7) Push a minimal assistant marker into history so reload shows the
+  //    trace summary in the chat. Per-step trace is in-flight only.
   if (typeof history !== "undefined" && Array.isArray(history)) {
     history.push({ role: "assistant", content: summaryText });
     try {
@@ -14072,7 +14024,7 @@ async function runAgenticCodeTask({ userText } = {}) {
   }
   if (typeof scrollToBottom === "function") scrollToBottom();
   return {
-    ok: written.length > 0 || (files.length === 0 && !streamError),
+    ok: written.length > 0 || (toolCalls.length === 0 && !streamError),
     summary: summaryText,
     files: written,
     failed
@@ -15456,6 +15408,12 @@ function clearChat(showNotice) {
   ensureChatWelcomeElement();
   history.length = 0;
   clearAttachments();
+  // Drop any in-flight agentic context so a follow-up message after the
+  // user hits "Clear" doesn't get auto-routed as an EDIT of the previous
+  // session's files.
+  if (typeof clearRecentAgenticContext === "function") {
+    try { clearRecentAgenticContext(); } catch (_) {}
+  }
   nextAllowedAt = 0;
   if (cooldownTimer) {
     clearInterval(cooldownTimer);
@@ -15635,7 +15593,7 @@ async function send() {
         }
         return;
       }
-      runAgenticCodeTask({ userText: prompt }).catch((err) => {
+      runAgenticCodeTask({ userText: prompt, recentContext: (typeof safeRecentAgenticContext === "function") ? safeRecentAgenticContext() : null }).catch((err) => {
         console.error("agentic run failed", err);
         addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
       });
@@ -15655,10 +15613,17 @@ async function send() {
   // tool caller (writes actual code to browser storage) without the user
   // needing to type `/agentic`. Disabled in incognito mode so incidental
   // prompts in a private session don't trigger file writes.
+  // We also pass `recentContext` so short follow-ups after a recent
+  // successful agentic run (e.g. "make the pipes blue", "fix the bug") route
+  // back here instead of falling through to the regular chat path and
+  // surfacing as "(No response)".
+  const recentAgentic = (typeof safeRecentAgenticContext === "function")
+    ? safeRecentAgenticContext()
+    : null;
   if (
     text &&
     typeof looksLikeCodingRequest === "function" &&
-    looksLikeCodingRequest(text) &&
+    looksLikeCodingRequest(text, recentAgentic) &&
     typeof runAgenticCodeTask === "function" &&
     !(typeof isIncognitoModeEnabled === "function" && isIncognitoModeEnabled())
   ) {
@@ -15666,7 +15631,7 @@ async function send() {
     if (codingPrompt) {
       // runAgenticCodeTask clears the input itself AFTER addMessage echoes it
       // and restores it on stream failure — so we don't clear here.
-      runAgenticCodeTask({ userText: codingPrompt }).catch((err) => {
+      runAgenticCodeTask({ userText: codingPrompt, recentContext: recentAgentic }).catch((err) => {
         console.error("auto agentic run failed", err);
         if (typeof addMessage === "function") {
           addMessage(
@@ -15838,6 +15803,12 @@ async function send() {
     renderSandboxUI();
   }
 
+  // Skip the typing-dots bubble when an agentic run is already emitting its
+  // own trace panel. Stacking the two is the three-UI overlap the user
+  // reported ("AI Checking code..." on top of the Working trace).
+  if (typeof ROK_AGENTIC_RUN_IN_FLIGHT !== "undefined" && ROK_AGENTIC_RUN_IN_FLIGHT) {
+    return;
+  }
   const typing = addMessage(
     "bot",
     "",
