@@ -13652,6 +13652,25 @@ function summarizeFileToolOutcomesForRequest(outcomes = [], text = "", intent = 
   return summary;
 }
 
+function shouldForceFileMutationContinuation(outcomes = [], text = "", intent = null) {
+  return (
+    requestLooksLikeCodingFileMutation(text, intent)
+    && outcomes.some((outcome) => outcome && outcome.ok && BUILTIN_FILE_TOOL_NAMES.has(normalizeBuiltinToolName(outcome.name)))
+    && !hasSuccessfulFileMutationOutcome(outcomes)
+  );
+}
+
+function buildFileMutationContinuationMessage(text = "") {
+  const userRequest = String(text || "").trim();
+  return [
+    "You have only inspected the workspace so far.",
+    "The user's request requires changing or creating a coding file.",
+    "Do not provide a final answer yet.",
+    "Call edit_file for a targeted change, or write_file if rewriting/creating the file is more reliable.",
+    userRequest ? `Original user request: ${userRequest}` : ""
+  ].filter(Boolean).join(" ");
+}
+
 function startGenerateImageTool(args = {}) {
   const prompt = normalizeImageToolPromptFragment(args.prompt || args.description || args.subject || "");
   if (!prompt) {
@@ -15329,6 +15348,7 @@ async function send() {
       // --- Auto-execute built-in tool calls and loop ---
       if (pendingToolCalls.length > 0 && toolsEnabled && allowedBuiltinToolNames.size) {
         let toolLoopCount = 0;
+        let forcedMutationFollowups = 0;
         let toolHistory = [...recentHistory];
         const fileToolOutcomes = [];
         // Add the original user message to tool history if not already there
@@ -15336,8 +15356,20 @@ async function send() {
           toolHistory.push({ role: "user", content: messageForApi });
         }
 
-        while (pendingToolCalls.length > 0 && toolLoopCount < BUILTIN_TOOL_MAX_LOOP && !stopRequested) {
+        while (
+          (
+            pendingToolCalls.length > 0
+            || (forcedMutationFollowups < 2 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent))
+          )
+          && toolLoopCount < BUILTIN_TOOL_MAX_LOOP
+          && !stopRequested
+        ) {
           toolLoopCount++;
+          if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
+            forcedMutationFollowups++;
+            toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
+            handleStatusUpdate("Continuing file edit...");
+          }
           const callsToExecute = pendingToolCalls.map((tc) => {
             const toolCallId = tc && tc.id
               ? String(tc.id)
@@ -15347,50 +15379,52 @@ async function send() {
           pendingToolCalls = [];
           processedToolCallIds.clear();
 
-          // Build assistant message with tool_calls for history
-          const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
-          const toolCallsForHistory = callsToExecute.map(tc => ({
-            id: tc.id,
-            type: "function",
-            function: {
-              name: getNormalizedToolCallName(tc) || "unknown",
-              arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
+          if (callsToExecute.length) {
+            // Build assistant message with tool_calls for history
+            const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
+            const toolCallsForHistory = callsToExecute.map(tc => ({
+              id: tc.id,
+              type: "function",
+              function: {
+                name: getNormalizedToolCallName(tc) || "unknown",
+                arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
+              }
+            }));
+            toolHistory.push({ role: "assistant", content: assistantContent, tool_calls: toolCallsForHistory });
+
+            // Execute each tool call and add results to history
+            for (const tc of callsToExecute) {
+              const toolName = getNormalizedToolCallName(tc) || "unknown";
+              let args = {};
+              try {
+                const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
+                args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
+              } catch (_) { args = {}; }
+
+              const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+              const callId = tc.id;
+              const resultContent = toolResult.ok
+                ? JSON.stringify(toolResult.result)
+                : JSON.stringify({ error: toolResult.error });
+
+              if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
+                fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+              }
+
+              handleStatusUpdate(toolResult.ok
+                ? `Ran ${toolName.replace(/_/g, " ")}`
+                : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
+              if (toolResult.skipped) {
+                appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
+              }
+
+              toolHistory.push({
+                role: "tool",
+                name: toolName,
+                tool_call_id: callId,
+                content: resultContent
+              });
             }
-          }));
-          toolHistory.push({ role: "assistant", content: assistantContent, tool_calls: toolCallsForHistory });
-
-          // Execute each tool call and add results to history
-          for (const tc of callsToExecute) {
-            const toolName = getNormalizedToolCallName(tc) || "unknown";
-            let args = {};
-            try {
-              const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
-              args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
-            } catch (_) { args = {}; }
-
-            const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
-            const callId = tc.id;
-            const resultContent = toolResult.ok
-              ? JSON.stringify(toolResult.result)
-              : JSON.stringify({ error: toolResult.error });
-
-            if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
-              fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
-            }
-
-            handleStatusUpdate(toolResult.ok
-              ? `Ran ${toolName.replace(/_/g, " ")}`
-              : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
-            if (toolResult.skipped) {
-              appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
-            }
-
-            toolHistory.push({
-              role: "tool",
-              name: toolName,
-              tool_call_id: callId,
-              content: resultContent
-            });
           }
 
           // Make follow-up request with tool results
@@ -15773,14 +15807,27 @@ async function send() {
     // --- Auto-execute built-in tool calls and loop ---
     if (pendingToolCalls.length > 0 && toolsEnabled && allowedBuiltinToolNames.size) {
       let toolLoopCount = 0;
+      let forcedMutationFollowups = 0;
       let toolHistory = [...recentHistory];
       const fileToolOutcomes = [];
       if (!toolHistory.length || toolHistory[toolHistory.length - 1].role !== "user") {
         toolHistory.push({ role: "user", content: messageForApi });
       }
 
-      while (pendingToolCalls.length > 0 && toolLoopCount < BUILTIN_TOOL_MAX_LOOP && !stopRequested) {
+      while (
+        (
+          pendingToolCalls.length > 0
+          || (forcedMutationFollowups < 2 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent))
+        )
+        && toolLoopCount < BUILTIN_TOOL_MAX_LOOP
+        && !stopRequested
+      ) {
         toolLoopCount++;
+        if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
+          forcedMutationFollowups++;
+          toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
+          handleStatusUpdate("Continuing file edit...");
+        }
         const callsToExecute = pendingToolCalls.map((tc) => {
           const toolCallId = tc && tc.id
             ? String(tc.id)
@@ -15790,48 +15837,50 @@ async function send() {
         pendingToolCalls = [];
         processedToolCallIds.clear();
 
-        const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
-        const toolCallsForHistory = callsToExecute.map(tc => ({
-          id: tc.id,
-          type: "function",
-          function: {
-            name: getNormalizedToolCallName(tc) || "unknown",
-            arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
+        if (callsToExecute.length) {
+          const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
+          const toolCallsForHistory = callsToExecute.map(tc => ({
+            id: tc.id,
+            type: "function",
+            function: {
+              name: getNormalizedToolCallName(tc) || "unknown",
+              arguments: (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {})
+            }
+          }));
+          toolHistory.push({ role: "assistant", content: assistantContent, tool_calls: toolCallsForHistory });
+
+          for (const tc of callsToExecute) {
+            const toolName = getNormalizedToolCallName(tc) || "unknown";
+            let args = {};
+            try {
+              const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
+              args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
+            } catch (_) { args = {}; }
+
+            const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+            const callId = tc.id;
+            const resultContent = toolResult.ok
+              ? JSON.stringify(toolResult.result)
+              : JSON.stringify({ error: toolResult.error });
+
+            if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
+              fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+            }
+
+            handleStatusUpdate(toolResult.ok
+              ? `Ran ${toolName.replace(/_/g, " ")}`
+              : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
+            if (toolResult.skipped) {
+              appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
+            }
+
+            toolHistory.push({
+              role: "tool",
+              name: toolName,
+              tool_call_id: callId,
+              content: resultContent
+            });
           }
-        }));
-        toolHistory.push({ role: "assistant", content: assistantContent, tool_calls: toolCallsForHistory });
-
-        for (const tc of callsToExecute) {
-          const toolName = getNormalizedToolCallName(tc) || "unknown";
-          let args = {};
-          try {
-            const argsRaw = (tc.function && tc.function.arguments) || JSON.stringify(tc.arguments || tc.params || {});
-            args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
-          } catch (_) { args = {}; }
-
-          const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
-          const callId = tc.id;
-          const resultContent = toolResult.ok
-            ? JSON.stringify(toolResult.result)
-            : JSON.stringify({ error: toolResult.error });
-
-          if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
-            fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
-          }
-
-          handleStatusUpdate(toolResult.ok
-            ? `Ran ${toolName.replace(/_/g, " ")}`
-            : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
-          if (toolResult.skipped) {
-            appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
-          }
-
-          toolHistory.push({
-            role: "tool",
-            name: toolName,
-            tool_call_id: callId,
-            content: resultContent
-          });
         }
 
         try {
