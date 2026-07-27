@@ -222,6 +222,7 @@ const SANDBOX_URL = buildApiUrl("/api/sandbox");
 const FILE_TOOLS_URL = buildApiUrl("/api/files");
 const INTENT_URL = buildApiUrl("/api/intent");
 const STATUS_URL = buildApiUrl("/api/status");
+const AGENTIC_STATUS_URL = buildApiUrl("/api/agentic/status");
 const MODELS_URL = buildApiUrl("/api/models");
 const CLIENT_CONFIG_URL = buildApiUrl("/api/client-config");
 const AUTH_SESSION_URL = buildApiUrl("/api/auth/session");
@@ -251,6 +252,7 @@ const LOCAL_LAST_MODEL_KEY = "rok.lastModelId.v1";
 const LOCAL_ONBOARDING_KEY = "rok.onboarding.v1";
 const LOCAL_TITAN_LOCK_UNTIL_KEY = "rok.titanLockUntil.v1";
 const LOCAL_DAEDALUS_LOCK_UNTIL_KEY = "rok.daedalusLockUntil.v1";
+const LOCAL_HERMES_LOCK_UNTIL_KEY = "rok.hermesLockUntil.v1";
 const LOCAL_DAEDALUS_OLLAMA_API_KEY = "rok.daedalusOllamaApiKey.v1";
 const LOCAL_CUSTOM_OLLAMA_API_KEY = "rok.customOllamaApiKey.v1";
 const LOCAL_CUSTOM_OLLAMA_MODEL_ID = "rok.customOllamaModelId.v1";
@@ -2523,7 +2525,13 @@ function getCustomOllamaModelValidationError(rawValue) {
 // Updated by refreshClientConfigFromServer() on boot and by applyThinkingQuotaFromHeaders()
 // after each chat response. The server enforces the real limit; this is UI-only.
 let serverThinkingQuota = { count: 0, limit: 10, exhausted: false, resetSec: 0, updatedAt: 0 };
-let titanLockUntil = 0;
+// --- Hermes 1.4 daily-cap lock (shared Ollama cloud cap; BYOK bypasses it) ---
+// Mirrors the titan/daedalus lock pattern. Surge: Hermes hits a daily-rate
+// 429 when /api/chat goes through Ollama; the backend marks this session
+// locked via /api/agentic/status + X-Hermes-* response headers. The frontend
+// surfaces the remaining wait time in the empty-reply hint so the user
+// knows exactly when to retry instead of staring at a silent failure.
+let hermesLockUntil = 0;
 
 // --- Daedalus quota (rolling tokens/hour; BYOK bypasses the shared limit) ---
 let serverDaedalusQuota = {
@@ -2582,6 +2590,110 @@ function isTitanQuotaLocked() {
     return false;
   }
   return remainingMs > 0;
+}
+
+// --- Hermes 1.4 lock helpers (independent of Titan/Daedalus) ---
+function loadHermesLockUntilFromStorage() {
+  try {
+    const raw = localStorage.getItem(LOCAL_HERMES_LOCK_UNTIL_KEY);
+    if (!raw) return 0;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= Date.now()) return 0;
+    return parsed;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function saveHermesLockUntilToStorage(value) {
+  try {
+    if (value > Date.now()) {
+      localStorage.setItem(LOCAL_HERMES_LOCK_UNTIL_KEY, String(Math.floor(value)));
+    } else {
+      localStorage.removeItem(LOCAL_HERMES_LOCK_UNTIL_KEY);
+    }
+  } catch (_) {}
+}
+
+function setHermesLockUntil(value) {
+  hermesLockUntil = Math.max(0, Number(value) || 0);
+  saveHermesLockUntilToStorage(hermesLockUntil);
+}
+
+function getHermesLockRemainingMs() {
+  return Math.max(0, hermesLockUntil - Date.now());
+}
+
+function isHermesQuotaLocked() {
+  const remainingMs = getHermesLockRemainingMs();
+  if (remainingMs <= 0 && hermesLockUntil > 0) {
+    setHermesLockUntil(0);
+    return false;
+  }
+  return remainingMs > 0;
+}
+
+function getHermesLockedSecondsRemaining() {
+  return Math.max(0, Math.ceil(getHermesLockRemainingMs() / 1000));
+}
+
+hermesLockUntil = loadHermesLockUntilFromStorage();
+
+// Pull lock state from /api/agentic/status, which the backend updates
+// whenever a /api/chat call surfaces a Hermes 429. Best effort — a probe
+// failure must NEVER block startup or other API calls.
+async function refreshAgenticStatusFromServer(options = {}) {
+  try {
+    const res = await fetchWithBanGuard(AGENTIC_STATUS_URL, {
+      method: "GET",
+      headers: { ...buildApiHeaders(false), Accept: "application/json" }
+    });
+    if (!res || !res.ok) return false;
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.includes("application/json")) return false;
+    const payload = await res.json();
+    if (!payload || typeof payload !== "object") return false;
+    applyAgenticStatusFromPayload(payload, options);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyAgenticStatusFromPayload(payload, options = {}) {
+  if (!payload || typeof payload !== "object") return;
+  const wasLocked = isHermesQuotaLocked();
+  const locked = Boolean(payload.locked);
+  if (locked) {
+    const retrySec = Math.max(1, Number(payload.retry_after_sec) || Number(payload.retryAfterSec) || 0);
+    const lockedUntil = Math.max(1, Number(payload.locked_until_sec) || Number(payload.lockedUntilSec) || 0);
+    const newUntil = lockedUntil > 0
+      ? lockedUntil * 1000
+      : Date.now() + retrySec * 1000;
+    setHermesLockUntil(newUntil);
+  } else if (!options.preserveWhenUnlocked) {
+    setHermesLockUntil(0);
+  }
+  if (wasLocked !== isHermesQuotaLocked() && typeof refreshSendState === "function") {
+    refreshSendState();
+  }
+}
+
+// Apply X-Hermes-* headers the backend sets on /api/chat responses when
+// Hermes reports a 429 (daily cap). Matches the applyThinkingQuotaFromHeaders
+// pattern so callers can just call this after every chat response.
+function applyAgenticLockFromHeaders(response) {
+  if (!response || !response.headers || response.headers.get("X-Hermes-Locked") == null) {
+    return;
+  }
+  const locked = (response.headers.get("X-Hermes-Locked") || "").toLowerCase() === "true";
+  if (!locked) return;
+  const retrySec = parseInt(response.headers.get("X-Hermes-Retry-After-Sec") || "0", 10) || 0;
+  const lockedUntilSec = parseInt(response.headers.get("X-Hermes-Locked-Until-Sec") || "0", 10) || 0;
+  const newUntil = lockedUntilSec > 0
+    ? lockedUntilSec * 1000
+    : Date.now() + Math.max(retrySec, 60) * 1000;
+  setHermesLockUntil(newUntil);
 }
 
 // --- Daedalus lock helpers (independent of Titan) ---
@@ -13192,7 +13304,31 @@ function createToolCallsPanel(initialSummary = "") {
     summaryLine.hidden = false;
     // Allow inline <code>, escape everything else by using textContent for
     // body and then promoting anything inside backticks to styled spans.
-    summaryLine.innerHTML = renderToolCallsSummary(safe);
+    // The escape-only path protects against `<img onerror=...>` in any model-
+    // written string (e.g. accidentally embedded in a tool-call summary), but
+    // DOMPurify (already loaded for chat bubbles) is the real defense in
+    // depth: even an attribute-context trick like ``\`x" onerror=...\`\``
+    // survives innerHTML assignment unless DOMPurify strips it.
+    const renderedHtml = renderToolCallsSummary(safe);
+    let sanitizedHtml = renderedHtml;
+    if (
+      typeof window !== "undefined"
+      && window.DOMPurify
+      && typeof window.DOMPurify.sanitize === "function"
+    ) {
+      try {
+        sanitizedHtml = window.DOMPurify.sanitize(renderedHtml, {
+          ALLOWED_TAGS: ["span", "b", "i", "em", "strong", "code", "br"],
+          ALLOWED_ATTR: ["class"],
+          KEEP_CONTENT: true
+        });
+      } catch (_) {
+        // DOMPurify should never throw on plain text but fall back to the
+        // manual escape if it does.
+        sanitizedHtml = renderedHtml;
+      }
+    }
+    summaryLine.innerHTML = sanitizedHtml;
     scrollToBottom();
   }
 
@@ -13384,6 +13520,16 @@ function escapeAgenticPromptPath(rawPath) {
     .trim();
 }
 
+// Inline directive appended to the LLM payload (not the chat bubble) for very
+// short /agentic prompts. Hermes 1.4 (gpt-oss:120b-cloud) tends to slip into
+// a pure-text reply for any prompt under ~25 chars ("make flappy bird",
+// "build a todo app", etc.) even though AGENTIC_CODING_SYSTEM_PROMPT says
+// NON-NEGOTIABLE. Putting the reminder in the user message anchors the
+// model's attention immediately before generation. The user's chat text and
+// history are left untouched.
+const AGENTIC_SHORT_PROMPT_AUGMENTER =
+  `\n\n[ROK directive] This is a very short request. You MUST respond by calling the native edit_file / write_file (or read_file / list_files) tool OR by emitting a single <rok_file path=\"...\">...</rok_file> block. Do NOT reply with empty content or only an apologetic paragraph.`;
+
 const AGENTIC_CODING_SYSTEM_PROMPT = [
   "You are the ROK agentic coding helper. You MUST use the provided native tool-calling API to create or modify files - never just emit raw XML, markdown fences, or code blocks as your only reply.",
   "",
@@ -13558,6 +13704,15 @@ function looksLikeCodingRequest(text, recentContext) {
 }
 
 function isAgenticModelLocked(modelId) {
+  // Hermes 1.4 has a shared daily Ollama-cloud cap. Whenever `/api/chat`
+  // hits a 429 from Hermes, the backend marks this session locked via
+  // X-Hermes-* response headers AND /api/agentic/status. With the lock in
+  // effect, agentic runs can no longer fall through to Hermes, so the
+  // empty-reply hint should tell the user exactly how long until unlock
+  // instead of silently degrading to a non-tool-calling model.
+  if (modelId === HERMES_MODEL_ID && typeof isHermesQuotaLocked === "function") {
+    return !!isHermesQuotaLocked();
+  }
   if (modelId === HYPERION_MODEL_ID && typeof isTitanQuotaLocked === "function") {
     return !!isTitanQuotaLocked();
   }
@@ -13653,9 +13808,21 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
   //    and overwrites it when they do, both of which would silently drop
   //    the agentic instructions. Read the overrides manually and prepend.
   const sessionModel = pickAgenticCodingModelId();
-  const messagePayload = (typeof buildMessageForApi === "function")
+  const baseMessagePayload = (typeof buildMessageForApi === "function")
     ? String(buildMessageForApi(text, ""))
     : text;
+  // Short prompts (<25 chars) silently confuse Hermes 1.4 into replying with
+  // empty / apologetic content even though AGENTIC_CODING_SYSTEM_PROMPT says
+  // tool calls are NON-NEGOTIABLE. Append an inline directive sentence to
+  // the LLM payload only — the user's chat text, history, and `addMessage`
+  // bubble above are all left unchanged so the chat shows the user's exact
+  // words. Only applies to agentic runs (this function is the only caller
+  // that uses AGENTIC_CODING_SYSTEM_PROMPT).
+  const messagePayload = (text.length < 25
+    && typeof AGENTIC_SHORT_PROMPT_AUGMENTER === "string"
+    && AGENTIC_SHORT_PROMPT_AUGMENTER)
+    ? `${baseMessagePayload}${AGENTIC_SHORT_PROMPT_AUGMENTER}`
+    : baseMessagePayload;
   // If we're in EDIT-followup mode, prepend explicit context about which
   // file was previously generated so the LLM treats the request as an edit.
   // IMPORTANT: this MUST align with the new tool-only system prompt above —
@@ -14017,14 +14184,27 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
       summaryText = `No tool calls in ROK's reply: "${prose}${fullText.length > 280 ? "\u2026" : ""}"`;
     } else {
       // Empty reply from the model. Tell the user exactly what to try next
-      // instead of a silent failure. Note: ONLY Hermes routes through Ollama's
-      // /api/chat end-to-end with native tool-calling support — Hyperion and
-      // Daedalus hit NVIDIA's API and the backend drops their tool_calls
-      // before reaching the browser. So we point at Hermes, not Hyperion.
+      // instead of a silent failure. Agentic runs always force Hermes — so
+      // the "switch your model" hint is misleading. Instead, surface the real
+      // cause: either Hermes is currently rate-limited (show the cooldown so
+      // they know exactly when to retry) or they ran a coding request from
+      // chat without `/agentic` and Hermes silently fell back to a model
+      // that can't carry tool_calls.
       const shortPromptHint = text.length < 25
         ? ` Your prompt is short (${text.length} chars) - try a longer directive one, e.g. "make a flappy bird game in a single HTML file called flappy_bird.html".`
         : "";
-      const modelHint = ` Make sure Hermes (gpt-oss-120b-cloud, ROK's Ollama-cloud model) is selected in the model picker — only Hermes has end-to-end native tool calling.`;
+      const hermesLockRemainingSec = (typeof getHermesLockedSecondsRemaining === "function")
+        ? Number(getHermesLockedSecondsRemaining()) || 0
+        : 0;
+      let modelHint;
+      if (hermesLockRemainingSec > 0) {
+        const waitMins = Math.max(1, Math.ceil(hermesLockRemainingSec / 60));
+        modelHint =
+          ` Hermes 1.4 (gpt-oss:120b-cloud) hit its shared daily rate limit - wait about ${waitMins} minute${waitMins === 1 ? "" : "s"} or add your own Ollama API key in Customize to bypass the shared cap.`;
+      } else {
+        modelHint =
+          ` \/agentic runs always use Hermes 1.4 (gpt-oss:120b-cloud). If you ran this from the regular chat composer, switch the model picker to Hermes and replay the request, or use the \/agentic command instead.`;
+      }
       summaryText =
         `No tool calls in ROK's reply — the model returned empty.` +
         shortPromptHint +
@@ -14780,8 +14960,25 @@ function getSandboxFileContentByPath(path = "") {
 //     step (read/list). Actual edits must come from the real file tools
 //     (edit_file / write_file) issued by the model.
 // ---------------------------------------------------------------------------
-function buildDeterministicFileMutationToolCall(outcomes = [], text = "", intent = null) {
+function buildDeterministicFileMutationToolCall(outcomes = [], text = "", intent = null, pendingToolCalls = []) {
   if (!shouldForceFileMutationContinuation(outcomes, text, intent)) return null;
+  // Deterministic ordering fix: do NOT inject a synthetic `read_forced` if
+  // the model already has a real `edit_file` / `write_file` pending OR has
+  // already attempted one (even a failed attempt). The model needs to retry
+  // the mutation itself, not bounce back to discovery. Without this guard,
+  // an edit-followup like "make the pipes blue" could end up emitting
+  // `list_files` + `read_file` forever while the model's own `edit_file`
+  // keeps being pre-empted by a forced re-read.
+  const allCalls = []
+    .concat(Array.isArray(pendingToolCalls) ? pendingToolCalls : [])
+    .concat(Array.isArray(outcomes)
+      ? outcomes.map((outcome) => ({ function: { name: outcome && outcome.name } }))
+      : []);
+  const hasPendingOrRecentMutation = allCalls.some((entry) => {
+    const fname = String(((entry && entry.function) || {}).name || "").trim();
+    return fname === "write_file" || fname === "edit_file";
+  });
+  if (hasPendingOrRecentMutation) return null;
   const targetPath = getSingleSandboxFilePathFromOutcomes(outcomes);
   if (!targetPath) return null;
   const hasRead = Boolean(getLastSuccessfulFileOutcome(outcomes, "read_file"));
@@ -16922,7 +17119,7 @@ async function send() {
         ) {
           toolLoopCount++;
           if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
-            const deterministicToolCall = buildDeterministicFileMutationToolCall(fileToolOutcomes, text, intent);
+            const deterministicToolCall = buildDeterministicFileMutationToolCall(fileToolOutcomes, text, intent, pendingToolCalls);
             if (deterministicToolCall) {
               // Surface this synthetic follow-up call in the live tool-caller UI
               // so the user sees why the agent loop is running another round.
