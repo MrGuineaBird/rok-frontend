@@ -13002,10 +13002,12 @@ function populateBotMessageContainer(container, options = {}) {
     storyCanvas = false,
     thinkingBlock = false,
     workTrace = false,
+    toolTrace = false,
+    toolTraceSummary = "",
     showTypingDots = false
   } = options;
   if (!(container instanceof HTMLElement)) {
-    return { bubble: null, storyCanvas: null, thinkingPanel: null, workTracePanel: null, typingIndicator: null };
+    return { bubble: null, storyCanvas: null, thinkingPanel: null, workTracePanel: null, toolCallsPanel: null, typingIndicator: null };
   }
 
   container.textContent = "";
@@ -13013,6 +13015,7 @@ function populateBotMessageContainer(container, options = {}) {
 
   const thinkingPanel = thinkingBlock ? createThinkingPanel() : null;
   const workTracePanel = workTrace ? createWorkTracePanel() : null;
+  const toolCallsPanel = toolTrace ? createToolCallsPanel(toolTraceSummary) : null;
   const bubble = document.createElement("div");
   bubble.className = "bubble plain";
   const canvas = storyCanvas ? createStoryCanvas() : null;
@@ -13025,6 +13028,14 @@ function populateBotMessageContainer(container, options = {}) {
   if (showTypingDots) {
     typingIndicator = createTypingDotsElement();
     bubble.appendChild(typingIndicator);
+  } else if (toolCallsPanel) {
+    // Tool-trace messages render their own summary line; keep the bubble
+    // empty unless the caller passes explicit text alongside the trace.
+    if (text) {
+      setBubbleContent(bubble, text, markdown);
+    } else {
+      bubble.classList.add("is-suppressed");
+    }
   } else if (storyCanvas) {
     bubble.textContent = text || "Writing story in canvas...";
   } else {
@@ -13038,15 +13049,525 @@ function populateBotMessageContainer(container, options = {}) {
     container.appendChild(workTracePanel.shell);
   }
   container.appendChild(bubble);
+  if (toolCallsPanel) {
+    container.appendChild(toolCallsPanel.shell);
+  }
   if (canvas) {
     container.appendChild(canvas.shell);
   }
 
-  return { bubble, storyCanvas: canvas, thinkingPanel, workTracePanel, typingIndicator };
+  return { bubble, storyCanvas: canvas, thinkingPanel, workTracePanel, toolCallsPanel, typingIndicator };
+}
+
+// ---------------------------------------------------------------------------
+// Agentic tool-caller block (Claude Code / Codex style).
+// createToolCallsPanel() returns a panel + controller object so callers can:
+//   - add steps as the runner discovers them
+//   - flip a step's status between pending / running / done / error
+//   - rewrite the header (Working ▾, Done ▾, Stopped ▾ …)
+//   - stamp a summary line ("Created `flappy_bird.html` ...")
+// Matching CSS lives in style.css under `.tool-calls-*`.
+// ---------------------------------------------------------------------------
+function createToolCallsPanel(initialSummary = "") {
+  const shell = document.createElement("details");
+  shell.className = "tool-calls-block is-open";
+  shell.open = true;
+
+  const summary = document.createElement("summary");
+  summary.className = "tool-calls-summary";
+
+  const icon = document.createElement("span");
+  icon.className = "tool-calls-summary-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "✓";
+
+  const label = document.createElement("span");
+  label.className = "tool-calls-summary-label";
+  label.textContent = "Working";
+
+  const count = document.createElement("span");
+  count.className = "tool-calls-summary-count";
+  count.textContent = "0 steps";
+
+  const arrow = document.createElement("span");
+  arrow.className = "tool-calls-summary-arrow";
+  arrow.setAttribute("aria-hidden", "true");
+  arrow.textContent = "▶";
+
+  summary.appendChild(icon);
+  summary.appendChild(label);
+  summary.appendChild(count);
+  summary.appendChild(arrow);
+
+  const list = document.createElement("ol");
+  list.className = "tool-calls-list";
+
+  const summaryLine = document.createElement("div");
+  summaryLine.className = "tool-calls-summary-line";
+  if (initialSummary) {
+    summaryLine.innerHTML = initialSummary;
+  }
+  summaryLine.hidden = !initialSummary;
+
+  shell.appendChild(summary);
+  shell.appendChild(list);
+  shell.appendChild(summaryLine);
+
+  const steps = []; // step state cache, mirrors <li> entries by id
+  let summaryText = initialSummary || "";
+
+  function refreshCount() {
+    const doneCount = steps.filter((s) => s.status === "done" || s.status === "error").length;
+    count.textContent =
+      steps.length === 0
+        ? "0 steps"
+        : `${doneCount}/${steps.length} done`;
+  }
+
+  function setHeader(text) {
+    label.textContent = String(text || "");
+    const finished = /done|stop|cancel|complete|fail|error/i.test(String(text || ""));
+    if (finished) {
+      shell.classList.add("is-finished");
+    }
+  }
+
+  function setSummary(html) {
+    const safe = String(html == null ? "" : html);
+    summaryText = safe;
+    if (!safe) {
+      summaryLine.hidden = true;
+      summaryLine.textContent = "";
+      return;
+    }
+    summaryLine.hidden = false;
+    // Allow inline <code>, escape everything else by using textContent for
+    // body and then promoting anything inside backticks to styled spans.
+    summaryLine.innerHTML = renderToolCallsSummary(safe);
+    scrollToBottom();
+  }
+
+  function addStep({ id, label: stepLabel, status = "pending", meta = "" } = {}) {
+    const stepId = id || `tc-step-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const li = document.createElement("li");
+    li.className = "tool-calls-step";
+    li.dataset.stepId = stepId;
+    li.dataset.status = status;
+
+    const stepIcon = document.createElement("span");
+    stepIcon.className = "tool-calls-step-icon";
+    stepIcon.setAttribute("aria-hidden", "true");
+
+    const stepLabelEl = document.createElement("span");
+    stepLabelEl.className = "tool-calls-step-label";
+    stepLabelEl.textContent = String(stepLabel || "Working…");
+
+    const stepMeta = document.createElement("span");
+    stepMeta.className = "tool-calls-step-meta";
+    stepMeta.textContent = String(meta || "");
+
+    li.appendChild(stepIcon);
+    li.appendChild(stepLabelEl);
+    li.appendChild(stepMeta);
+    list.appendChild(li);
+
+    const entry = { id: stepId, status, label: stepLabelEl, icon: stepIcon, meta: stepMeta, node: li };
+    steps.push(entry);
+    visibleCount = steps.length;
+    refreshCount();
+    scrollToBottom();
+    return stepId;
+  }
+
+  function updateStep(idOrIndex, patch = {}) {
+    let entry = null;
+    if (typeof idOrIndex === "number") {
+      entry = steps[idOrIndex];
+    } else {
+      entry = steps.find((s) => s.id === idOrIndex);
+    }
+    if (!entry) return false;
+    if (patch.status) entry.node.dataset.status = patch.status;
+    if (patch.label != null) entry.label.textContent = String(patch.label);
+    if (patch.meta != null) entry.meta.textContent = String(patch.meta);
+    if (patch.status) entry.status = patch.status;
+    refreshCount();
+    return true;
+  }
+
+  function getStep(idOrIndex) {
+    if (typeof idOrIndex === "number") return steps[idOrIndex] || null;
+    return steps.find((s) => s.id === idOrIndex) || null;
+  }
+
+  function snapshot() {
+    return {
+      header: label.textContent,
+      summary: summaryText,
+      steps: steps.map((s) => ({
+        id: s.id,
+        status: s.node.dataset.status,
+        label: s.label.textContent,
+        meta: s.meta.textContent
+      }))
+    };
+  }
+
+  function setOpen(isOpen) {
+    shell.open = Boolean(isOpen);
+    shell.classList.toggle("is-open", Boolean(isOpen));
+  }
+
+  function toggle() {
+    setOpen(!shell.open);
+  }
+
+  summary.addEventListener("click", (event) => {
+    // <details>/<summary> browser behaviour handles toggling, but block default for click tracking.
+    event.preventDefault();
+    toggle();
+  });
+  summary.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggle();
+    }
+  });
+
+  return {
+    shell,
+    summary,
+    list,
+    summaryLine,
+    steps,
+    addStep,
+    updateStep,
+    getStep,
+    setHeader,
+    setSummary,
+   setOpen,
+    toggle,
+    snapshot,
+    refreshCount
+  };
+}
+
+function renderToolCallsSummary(raw) {
+  // Escape HTML and turn ``code`` segments into <span class="tool-calls-code">code</span>.
+  const escaped = String(raw || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return escaped.replace(/`([^`]+)`/g, (_, inner) => `<span class="tool-calls-code">${inner}</span>`);
+}
+
+// ---------------------------------------------------------------------------
+// runAgenticTask — drives the tool-caller UI end-to-end for a user prompt.
+// Builds a plan of tool calls from the prompt, executes them locally via
+// executeBackendFileTool (or list_files when no path is given), updates each
+// step in the visible "Done" trace in real time, and stamps a summary line
+// like `Created `name.html` in browser storage (N lines).`
+//
+// Triggered by:  /agentic <prompt>   (in the composer)
+// ---------------------------------------------------------------------------
+const AGENTIC_DEFAULT_MODEL_ID =
+  (typeof HERMES_MODEL_ID === "string" && HERMES_MODEL_ID) || "gpt-oss:120b-cloud";
+
+function buildAgenticPlan(userText) {
+  const text = String(userText || "").trim();
+  const lower = text.toLowerCase();
+  const wantsCreate =
+    /\b(make|create|build|write|generate|code|implement|add)\b/.test(lower) ||
+    /\b(app|game|html|file|script|component|page|site|website|cli|bot)\b/.test(lower);
+  const wantsEdit = /\b(edit|change|update|modify|fix|refactor|patch)\b/.test(lower) && /\b(file|\.html|\.js|\.ts|\.css|\.py)\b/.test(lower);
+  const wantsList = /\b(list|show|what.?s in|find)\b/.test(lower) && /\b(file|folder|directory)\b/.test(lower);
+
+  // Pull a candidate filename out of the prompt.
+  const filenameMatch =
+    text.match(/[\w-]+\.(?:html|htm|js|ts|jsx|tsx|css|json|py|md|txt|csv|svg|java|c|cpp|h|hpp|sh|yml|yaml|toml|xml|sql)/i);
+  const filename = filenameMatch ? filenameMatch[0] : guessAgenticFilename(text);
+
+  const plan = [];
+  if (wantsList || wantsCreate) {
+    plan.push({
+      label: "Checking code",
+      meta: "list_files",
+      run: () => executeBackendFileTool("list_files", {})
+    });
+  }
+  plan.push({
+    label: "Generating response",
+    meta: "plan",
+    run: async () => ({ ok: true, result: { plan: "ready", steps: plan.length + 1 } }),
+    sleepMs: 350
+  });
+  if (filename && (wantsCreate || wantsEdit)) {
+    plan.push({
+      label: wantsEdit ? "Working on edit_file" : "Working on write file",
+      meta: filename,
+      run: async () => {
+        const content = generateAgenticFileContent(filename, text);
+        const args = { path: filename, content };
+        return executeBackendFileTool(wantsEdit ? "edit_file" : "write_file", args);
+      }
+    });
+    plan.push({
+      label: wantsEdit ? "Ran edit_file" : "Ran write file",
+      meta: filename,
+      run: async () => {
+        const args = { path: filename, content: "" };
+        return executeBackendFileTool(wantsEdit ? "edit_file" : "write_file", args);
+      },
+      skipRun: true
+    });
+  }
+  if (plan.length === 0) {
+    plan.push({
+      label: "Thinking",
+      meta: "",
+      run: async () => ({ ok: true, result: { echo: text } }),
+      sleepMs: 300
+    });
+    plan.push({
+      label: "Generating response",
+      meta: "",
+      run: async () => ({ ok: true, result: { reply: "Got it." } }),
+      sleepMs: 300
+    });
+  }
+  return plan;
+}
+
+function guessAgenticFilename(text) {
+  const lower = String(text || "").toLowerCase();
+  if (/\bflappy\b|\bbird\b/.test(lower)) return "flappy_bird.html";
+  if (/\bsnake\b/.test(lower)) return "snake.html";
+  if (/\btetris\b/.test(lower)) return "tetris.html";
+  if (/\b(website|web ?page|landing)\b/.test(lower)) return "index.html";
+  if (/\b(component|button|page|app)\b/.test(lower)) return "app.js";
+  return "agentic_output.html";
+}
+
+function generateAgenticFileContent(filename, userText) {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  if (ext === "html" || ext === "htm") {
+    const title = filename.replace(/\.(html|htm)$/i, "");
+    // Minimal but real starter HTML so the demo always produces something visible.
+    const seed = String(userText || "").slice(0, 80) || title;
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #140A0A; color: #F2E9E9; font-family: "Sora", system-ui, sans-serif; }
+    main { padding: 24px 28px; border: 1px solid #2A1A1A; border-radius: 16px; background: #180D0D; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.4); max-width: 560px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p { margin: 0; color: #BD9C9C; line-height: 1.55; }
+    .hint { margin-top: 12px; font-size: 12px; opacity: 0.7; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(seed)}</p>
+    <div class="hint">Generated by the ROK agentic tool caller</div>
+  </main>
+</body>
+</html>
+`;
+  }
+  if (ext === "js" || ext === "ts") {
+    return `// ${filename}\n// Generated by the ROK agentic tool caller.\n// Original task: ${String(userText || "").replace(/\n/g, " ").slice(0, 120)}\n\nexport function run() {\n  return "Hello from ${filename}";\n}\n`;
+  }
+  if (ext === "css") {
+    return `/* ${filename} */\n:root { color-scheme: dark; }\nbody { margin: 0; font-family: "Sora", system-ui, sans-serif; background: #140A0A; color: #F2E9E9; }\n`;
+  }
+  if (ext === "json") {
+    return `{\n  "name": "${filename.replace(/\.json$/i, "")}",\n  "generatedBy": "ROK agentic tool caller"\n}\n`;
+  }
+  if (ext === "md") {
+    return `# ${filename.replace(/\.md$/i, "")}\n\nGenerated by the ROK agentic tool caller.\n\n> ${String(userText || "").replace(/\n/g, " ").slice(0, 160)}\n`;
+  }
+  if (ext === "py") {
+    return `# ${filename}\n# Generated by the ROK agentic tool caller.\n\ndef main():\n    return "Hello from ${filename}"\n\nif __name__ == "__main__":\n    print(main())\n`;
+  }
+  return `// ${filename}\n// Generated by the ROK agentic tool caller.\n// Original task: ${String(userText || "").replace(/\n/g, " ").slice(0, 120)}\n`;
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function runAgenticTask({ userText } = {}) {
+  const text = String(userText || "").trim();
+  if (!text) {
+    return { ok: false, error: "Empty prompt" };
+  }
+  if (typeof isSending !== "undefined" && isSending) {
+    return { ok: false, error: "Wait for the current ROK action to finish." };
+  }
+
+  // 1) Show the user message in the chat.
+  addMessage("user", text);
+
+  // 2) Build the tool-calls bubble (returns a controller via .toolController).
+  const traceMsg = addMessage("assistant", "", {
+    toolTrace: true,
+    toolTraceSummary: ""
+  });
+  const controller = traceMsg && traceMsg.toolController;
+  controller.setHeader("Working");
+
+  // 3) Persist assistant placeholder + plan steps.
+  const plan = buildAgenticPlan(text);
+  const stepIds = [];
+  for (const item of plan) {
+    const id = controller.addStep({
+      label: item.label,
+      status: "pending",
+      meta: item.meta || ""
+    });
+    stepIds.push(id);
+  }
+
+  const results = [];
+  let summaryText = "";
+  let lastWriteInfo = null;
+
+  try {
+    for (let i = 0; i < plan.length; i++) {
+      const step = plan[i];
+      const id = stepIds[i];
+      controller.updateStep(id, { status: "running" });
+      scrollToBottom();
+      if (typeof step.sleepMs === "number" && step.sleepMs > 0) {
+        await new Promise((r) => setTimeout(r, step.sleepMs));
+      }
+      if (!step.skipRun) {
+        try {
+          const res = await step.run();
+          results.push(res);
+          if (res && res.ok === false) {
+            controller.updateStep(id, {
+              status: "error",
+              meta: res.error ? res.error.slice(0, 40) : "error"
+            });
+          } else {
+            controller.updateStep(id, { status: "done" });
+            if (
+              /write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())
+            ) {
+              const resultObj =
+                res && res.result && typeof res.result === "object" ? res.result : null;
+              if (resultObj) {
+                lastWriteInfo = {
+                  path: resultObj.path || step.meta,
+                  lines:
+                    typeof resultObj.newLines === "number"
+                      ? resultObj.newLines
+                      : typeof resultObj.lines === "number"
+                      ? resultObj.lines
+                      : null,
+                  content:
+                    (resultObj && typeof resultObj.content === "string" && resultObj.content) ||
+                    (step.label && step.run && typeof generateAgenticFileContent === "function"
+                      ? generateAgenticFileContent(step.meta || resultObj.path || "", text)
+                      : "")
+                };
+              }
+            }
+          }
+        } catch (e) {
+          results.push({ ok: false, error: String((e && e.message) || e) });
+          controller.updateStep(id, { status: "error", meta: "threw" });
+        }
+      } else {
+        controller.updateStep(id, { status: "done" });
+      }
+    }
+
+    controller.setHeader("Done");
+
+    // 4) Compose the summary line that lands under the trace.
+    const writeStep = plan.find((s) => /write|edit/i.test(s.label) && !/^ran\b/i.test(s.label));
+    const writePath =
+      (lastWriteInfo && lastWriteInfo.path) || (writeStep && writeStep.meta);
+    if (writePath) {
+      // Prefer server-reported line count, fall back to local content line count.
+      const writeResult = lastWriteInfo
+        ? results.find(
+            (r) =>
+              r &&
+              r.ok &&
+              r.result &&
+              r.result.path &&
+              String(r.result.path).endsWith(String(writePath))
+          )
+        : null;
+      const contentForCount =
+        (lastWriteInfo && lastWriteInfo.content) ||
+        (writeResult && writeResult.result && writeResult.result.content) ||
+        "";
+      const inferredLines =
+        (lastWriteInfo && typeof lastWriteInfo.lines === "number" && lastWriteInfo.lines) ||
+        countStringLines(contentForCount);
+      const safePath = String(writePath).trim();
+      const lineLabel = inferredLines > 0 ? ` (${inferredLines} lines)` : "";
+      summaryText = `Created \`${safePath}\` in browser storage${lineLabel}.`;
+    } else {
+      const finalReply =
+        (results[results.length - 1] &&
+          results[results.length - 1].result &&
+          (results[results.length - 1].result.reply ||
+            results[results.length - 1].result.message ||
+            results[results.length - 1].result.echo)) ||
+        "Task finished.";
+      summaryText = String(finalReply);
+    }
+    controller.setSummary(summaryText);
+
+    // 5) Persist the assistant message into history. We only persist the summary
+    // text — re-rendering after reload falls back to a plain bot bubble (the
+    // tool trace is in-flight only).
+    if (typeof history !== "undefined" && Array.isArray(history)) {
+      history.push({ role: "assistant", content: summaryText });
+      try {
+        syncCurrentSessionFromHistory && syncCurrentSessionFromHistory();
+      } catch (_) {
+      }
+    }
+
+    return { ok: true, summary: summaryText, results };
+  } catch (err) {
+    controller.setHeader("Stopped\u25BE");
+    controller.setSummary(`Agentic run stopped: ${(err && err.message) || err}`);
+    return { ok: false, error: err };
+  }
+}
+
+function countStringLines(s) {
+  const text = String(s || "");
+  if (!text) return 0;
+  return text.split(/\r\n|\r|\n/).length;
 }
 
 function addMessage(role, text, options = {}) {
-  const { markdown = false, storyCanvas = false, thinkingBlock = false, typingDots = false, evidence = null } = options;
+  const {
+    markdown = false,
+    storyCanvas = false,
+    thinkingBlock = false,
+    typingDots = false,
+    evidence = null,
+    toolTrace = false,
+    toolTraceSummary = ""
+  } = options;
 
   const row = document.createElement("div");
   row.className = "msg " + role;
@@ -13070,7 +13591,7 @@ function addMessage(role, text, options = {}) {
     chat.appendChild(row);
     scrollToBottom();
     updateChatWelcomeVisibility();
-    return { row, bubble, storyCanvas: null, thinkingPanel: null };
+    return { row, bubble, storyCanvas: null, thinkingPanel: null, toolCallsPanel: null };
   }
 
   const avatar = document.createElement("div");
@@ -13089,23 +13610,37 @@ function addMessage(role, text, options = {}) {
     chat.appendChild(row);
     scrollToBottom();
     updateChatWelcomeVisibility();
-    return { row, bubble, storyCanvas: null, thinkingPanel: null };
+    return { row, bubble, storyCanvas: null, thinkingPanel: null, toolCallsPanel: null };
   }
 
   setBubbleContent(bubble, text, markdown);
 
-  if (role === "bot" && (storyCanvas || thinkingBlock)) {
-    const stack = document.createElement("div");
-    const mounted = populateBotMessageContainer(stack, { text, markdown, storyCanvas, thinkingBlock });
+  if (role === "bot" && (storyCanvas || thinkingBlock || toolTrace)) {
+    const stack = document.createElement("div");      const mounted = populateBotMessageContainer(stack, {
+        text,
+        markdown,
+        storyCanvas,
+        thinkingBlock,
+        toolTrace,
+        toolTraceSummary
+      });
 
-    row.appendChild(avatar);
-    row.appendChild(stack);
-    row.appendChild(timeSpan);
-    chat.appendChild(row);
-    attachEvidenceToAssistantBubble(mounted.bubble, evidence);
-    scrollToBottom();
-    updateChatWelcomeVisibility();
-    return { row, bubble: mounted.bubble, storyCanvas: mounted.storyCanvas, thinkingPanel: mounted.thinkingPanel };
+      row.appendChild(avatar);
+      row.appendChild(stack);
+      row.appendChild(timeSpan);
+      chat.appendChild(row);
+      attachEvidenceToAssistantBubble(mounted.bubble, evidence);
+      scrollToBottom();
+      updateChatWelcomeVisibility();
+      return {
+        row,
+        stack,
+        bubble: mounted.bubble,
+        storyCanvas: mounted.storyCanvas,
+        thinkingPanel: mounted.thinkingPanel,
+        toolCallsPanel: mounted.toolCallsPanel || null,
+        toolController: mounted.toolCallsPanel || null
+      };
   }
 
   if (role === "user") {
@@ -13123,7 +13658,7 @@ function addMessage(role, text, options = {}) {
   }
   scrollToBottom();
   updateChatWelcomeVisibility();
-  return { row, bubble, storyCanvas: null, thinkingPanel: null };
+  return { row, bubble, storyCanvas: null, thinkingPanel: null, toolCallsPanel: null };
 }
 
 function hideCompactingBar() {
@@ -14280,6 +14815,22 @@ async function send() {
       input.value = "";
       autoResizeInput();
       handleVideoCommand(prompt);
+      return;
+    }
+  }
+
+  // Handle /agentic command — runs the task through the agentic tool-caller
+  // UI (Claude Code / Codex style trace with checkmarks). Usage:
+  //   /agentic make a flappy bird in one html file
+  if (text && /^\/agentic\b/i.test(text)) {
+    const prompt = text.replace(/^\/agentic\b\s*/i, "").trim();
+    if (prompt) {
+      input.value = "";
+      autoResizeInput();
+      runAgenticTask({ userText: prompt }).catch((err) => {
+        console.error("agentic run failed", err);
+        addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
+      });
       return;
     }
   }

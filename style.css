@@ -12257,3 +12257,264 @@ button.stop-mode:hover {
     border-bottom: 1px solid rgba(95, 112, 132, 0.2);
   }
 }
+
+/* -------------------------------------------------------------
+   Agentic tool-caller block (Claude Code / Codex style).
+   Rendered by createToolCallsPanel() in app.js and controlled
+   by the toolController returned from addMessage({ toolTrace }).
+   ------------------------------------------------------------- */
+
+.bot-stack .tool-calls-block {
+  width: 100%;
+  margin: 4px 0 6px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.tool-calls-block {
+  font-family: "Sora", "Segoe UI", sans-serif;
+  color: var(--text);
+}
+
+.tool-calls-summary {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 12px;
+  margin: 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: #F4CACA;
+  background: rgba(209, 75, 75, 0.10);
+  border: 1px solid rgba(209, 75, 75, 0.42);
+  border-radius: 10px;
+  user-select: none;
+}
+
+.tool-calls-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-calls-summary::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent, #d14b4b);
+}
+
+.tool-calls-summary:hover {
+  background: rgba(209, 75, 75, 0.16);
+  border-color: rgba(209, 75, 75, 0.6);
+}
+
+.tool-calls-summary-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--accent, #d14b4b);
+  color: #1A0E0E;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.tool-calls-summary-label {
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+
+.tool-calls-summary-count {
+  font-size: 11px;
+  color: #C9A0A0;
+  font-weight: 600;
+}
+
+.tool-calls-summary-arrow {
+  display: inline-block;
+  width: 10px;
+  text-align: center;
+  font-size: 11px;
+  color: #D49A9A;
+  transition: transform 160ms ease;
+}
+
+.tool-calls-block[open] .tool-calls-summary-arrow,
+.tool-calls-block.is-open .tool-calls-summary-arrow {
+  transform: rotate(90deg);
+}
+
+.tool-calls-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 6px 14px;
+  border-left: 2px solid rgba(209, 75, 75, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool-calls-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 13px;
+  color: #D2A8A8;
+  line-height: 1.35;
+}
+
+.tool-calls-step-icon {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid rgba(209, 75, 75, 0.45);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  color: #1A0E0E;
+}
+
+.tool-calls-step-icon::before {
+  content: "";
+  width: 7px;
+  height: 4px;
+  border-left: 2px solid #1A0E0E;
+  border-bottom: 2px solid #1A0E0E;
+  transform: rotate(-45deg) translate(0px, -1px);
+  opacity: 0;
+}
+
+.tool-calls-step-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-calls-step-meta {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #A77E7E;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-calls-step[data-status="pending"] {
+  color: #9D7E7E;
+}
+.tool-calls-step[data-status="pending"] .tool-calls-step-icon {
+  border-color: rgba(190, 130, 130, 0.35);
+  background: transparent;
+}
+
+.tool-calls-step[data-status="running"] {
+  color: #F2D0D0;
+}
+.tool-calls-step[data-status="running"] .tool-calls-step-icon {
+  background: transparent;
+  border-color: var(--accent, #d14b4b);
+  position: relative;
+}
+.tool-calls-step[data-status="running"] .tool-calls-step-icon::before {
+  opacity: 0;
+  display: none;
+}
+.tool-calls-step[data-status="running"] .tool-calls-step-icon::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--accent, #d14b4b);
+  animation: tool-calls-spin 0.8s linear infinite;
+}
+
+.tool-calls-step[data-status="done"] {
+  color: #F2DCDC;
+}
+.tool-calls-step[data-status="done"] .tool-calls-step-icon {
+  background: var(--accent, #d14b4b);
+  border-color: var(--accent, #d14b4b);
+}
+.tool-calls-step[data-status="done"] .tool-calls-step-icon::before {
+  opacity: 1;
+}
+
+.tool-calls-step[data-status="error"] {
+  color: #F4B0B0;
+}
+.tool-calls-step[data-status="error"] .tool-calls-step-icon {
+  background: transparent;
+  border-color: #E36A6A;
+  color: #E36A6A;
+}
+.tool-calls-step[data-status="error"] .tool-calls-step-icon::before {
+  opacity: 0;
+  display: none;
+}
+.tool-calls-step[data-status="error"] .tool-calls-step-icon::after {
+  content: "!";
+  font-size: 11px;
+  font-weight: 800;
+  color: #E36A6A;
+}
+
+@keyframes tool-calls-spin {
+  to { transform: rotate(360deg); }
+}
+
+.tool-calls-summary-line {
+  margin: 8px 0 0;
+  padding: 0;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #EBC8C8;
+}
+
+.tool-calls-summary-line code,
+.tool-calls-summary-line .tool-calls-code {
+  color: #F4CACA;
+  background: rgba(209, 75, 75, 0.12);
+  border: 1px solid rgba(209, 75, 75, 0.25);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.tool-calls-toggle-tools {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #C9A0A0;
+}
+
+body.settings-reduce-motion .tool-calls-step[data-status="running"] .tool-calls-step-icon::after {
+  animation: none;
+  border-top-color: var(--accent, #d14b4b);
+}
+body.settings-reduce-motion .tool-calls-summary-arrow {
+  transition: none;
+}
+
+/* When a tool-trace message renders its own summary line, hide the empty
+   sibling bubble so we don't get a phantom empty bubble next to the trace. */
+.bubble.is-suppressed {
+  display: none !important;
+}
