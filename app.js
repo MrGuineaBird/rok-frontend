@@ -2616,8 +2616,17 @@ function saveHermesLockUntilToStorage(value) {
 }
 
 function setHermesLockUntil(value) {
-  hermesLockUntil = Math.max(0, Number(value) || 0);
+  const next = Math.max(0, Number(value) || 0);
+  const wasLocked = hermesLockUntil > Date.now();
+  hermesLockUntil = next;
   saveHermesLockUntilToStorage(hermesLockUntil);
+  // Mirror the Titan/Daedalus pattern: when the lock flips on or off, push a
+  // send-state refresh so the composer button can grey out / show the lock
+  // pill without waiting for the next user interaction.
+  const isLocked = hermesLockUntil > Date.now();
+  if (wasLocked !== isLocked && typeof refreshSendState === "function") {
+    refreshSendState();
+  }
 }
 
 function getHermesLockRemainingMs() {
@@ -10061,8 +10070,9 @@ async function runSandboxAnalysis(promptText, recentHistory, sessionModel) {
         signal: activeRequestController.signal,
         body: JSON.stringify(requestBody)
       });
-      applyThinkingQuotaFromHeaders(res);
-      applyDaedalusQuotaFromHeaders(res);
+    applyThinkingQuotaFromHeaders(res);
+    applyDaedalusQuotaFromHeaders(res);
+    if (typeof applyAgenticLockFromHeaders === "function") applyAgenticLockFromHeaders(res);
       if (attempt < AUTO_MESSAGE_RETRY_LIMIT && !res.ok) {
         throw buildRetryableRequestError(res, `ROK CODE request failed (${res.status || "unknown"})`);
       }
@@ -13723,6 +13733,19 @@ function isAgenticModelLocked(modelId) {
 }
 
 function pickAgenticCodingModelId() {
+  // BYOK (Bring Your Own Key) bypass: if the user has attached their own
+  // Ollama API key for Hermes 1.4 (read by getSavedUserOllamaApiKeyForModel
+  // and forwarded via the X-ROK-Ollama-Key header from buildApiHeaders),
+  // the SHARED daily cap doesn't apply to them — they pay their own quota
+  // to the same provider. Pick Hermes up-front regardless of any locally-
+  // observed lock so a previous-tab state from the shared pool can't block
+  // a BYOK user's /agentic run.
+  const hasByokForHermes = (
+    typeof getSavedUserOllamaApiKeyForModel === "function"
+    && Boolean(getSavedUserOllamaApiKeyForModel(HERMES_MODEL_ID))
+  );
+  if (hasByokForHermes) return HERMES_MODEL_ID;
+
   // Agentic runs ALWAYS go through Hermes 1.4 (gpt-oss:120b-cloud) — it is the
   // only model that routes through Ollama's /api/chat with end-to-end native
   // tool-calling support. Hyperion (glm-5.2) and Daedalus (glm-4.7) hit
@@ -13748,6 +13771,18 @@ function pickAgenticCodingModelId() {
     if (!isAgenticModelLocked(id)) return id;
   }
   if (sessionModel && !isAgenticModelLocked(sessionModel)) return sessionModel;
+  // Last-resort fallback was AGENTIC_CODING_MODEL_ID (= Hermes). When EVERY
+  // native-coding channel is locked (Hermes daily cap + Titan + Daedalus all
+  // exhausted), returning Hermes here would guarantee a 429 from the backend
+  // and waste the user's submit. Surface a clean rejection so runAgenticCodeTask
+  // can explain it without burning a round-trip.
+  if (typeof isHermesQuotaLocked === "function" && isHermesQuotaLocked()) {
+    const err = new Error("Hermes 1.4 is at its shared daily rate limit and no fallback coding model is available. Please wait or add your own Ollama API key in Customize.");
+    err.code = "agentic_unavailable";
+    err.retryStatus = 503;
+    err.lockedUntilSec = Math.floor(Date.now() / 1000) + Math.max(1, Math.ceil((typeof getHermesLockedSecondsRemaining === "function" ? getHermesLockedSecondsRemaining() : 0)));
+    throw err;
+  }
   return AGENTIC_CODING_MODEL_ID;
 }
 
@@ -13794,7 +13829,48 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
   const controller = traceMsg && traceMsg.toolController;
   if (!controller) return { ok: false, error: "Failed to open tool trace panel." };
   controller.setHeader("Working");
-  const idCall = controller.addStep({ label: "Calling ROK", status: "running", meta: pickAgenticCodingModelId() });
+  const idCall = controller.addStep({ label: "Calling ROK", status: "running", meta: "picking model" });
+  // Resolve the agentic coding model BEFORE building request body so a
+  // locked-Hermes-no-fallback rejection (pickAgenticCodingModelId throws
+  // `err.code === "agentic_unavailable"`) can surface in the trace panel
+  // without burning a network round-trip.
+  let sessionModel;
+  try {
+    sessionModel = pickAgenticCodingModelId();
+    controller.updateStep(idCall, { label: "Calling ROK", status: "running", meta: sessionModel });
+  } catch (pickErr) {
+    if (pickErr && pickErr.code === "agentic_unavailable") {
+      controller.updateStep(idCall, { status: "error", meta: "all coding models locked" });
+      controller.setHeader("Stopped");
+      controller.setSummary(String(pickErr.message || "All coding models are locked. Wait or add your own Ollama API key in Customize."));
+      // Restore user input so they can retry with a different approach.
+      if (typeof input !== "undefined" && input) input.value = text;
+      if (typeof autoResizeInput === "function") autoResizeInput();
+      isSending = wasSending;
+      if (typeof refreshSendState === "function") refreshSendState();
+      ROK_AGENTIC_RUN_IN_FLIGHT = false;
+      // Surface as a system marker in the chat so the user understands why
+      // their /agentic submit vanished. Prefix tag [agentic_rejected] makes
+      // the event greppable via chatSearchBar and is also visible if the
+      // user scrolls back. Also push to history directly with a metadata
+      // marker (`rok.system_kind === "agentic_rejected"`) so audit-style
+      // tooling can pattern-match without parsing the content string.
+      const rejectedMessage = String(pickErr.message || "All coding models are locked.");
+      if (typeof addMessage === "function") {
+        addMessage("system", `[agentic_rejected] ${rejectedMessage}`);
+      }
+      if (typeof history !== "undefined" && Array.isArray(history)) {
+        history.push({
+          role: "system",
+          content: `[agentic_rejected] ${rejectedMessage}`,
+          rok: { systemKind: "agentic_rejected", lockedUntilSec: Number(pickErr.lockedUntilSec) || 0 }
+        });
+        try { syncCurrentSessionFromHistory && syncCurrentSessionFromHistory(); } catch (_) {}
+      }
+      return { ok: false, error: rejectedMessage };
+    }
+    throw pickErr;
+  }
   const idParse = controller.addStep({ label: "Collecting tool calls", status: "pending", meta: "" });
   const idWrite = controller.addStep({ label: "Executing tools", status: "pending", meta: "" });
 
@@ -13807,7 +13883,8 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
   //    helper deletes custom_system_prompt when the user has no override
   //    and overwrites it when they do, both of which would silently drop
   //    the agentic instructions. Read the overrides manually and prepend.
-  const sessionModel = pickAgenticCodingModelId();
+  // `sessionModel` is declared above inside the try/catch around pickAgenticCodingModelId(),
+  // so the locked-Hermes rejection path can short-circuit before this point.
   const baseMessagePayload = (typeof buildMessageForApi === "function")
     ? String(buildMessageForApi(text, ""))
     : text;
@@ -13913,11 +13990,43 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
     });
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
     if (!response.ok || contentType.includes("text/html")) {
+      // Hermes 1.4 has a shared daily Ollama cap. When the backend hits that
+      // cap and returns the JSON 429 with `code: "hermes_locked"`, persist
+      // the cooldown locally + re-throw an error decorated with the retry
+      // seconds so the trace panel + empty-reply hint can show a real "wait
+      // ~N minutes" string (instead of "stream failed"). The header-based
+      // path is best-effort and may run before the JSON parse below — both
+      // are safe to call.
+      if (response.status === 429 && typeof applyAgenticLockFromHeaders === "function") {
+        try { applyAgenticLockFromHeaders(response); } catch (_) { /* noop */ }
+      }
       const errorText = await safeReadResponseText(response);
+      if (response.status === 429 && errorText) {
+        let parsed = null;
+        try { parsed = JSON.parse(errorText); } catch (_) { parsed = null; }
+        if (parsed && parsed.code === "hermes_locked") {
+          if (typeof applyAgenticStatusFromPayload === "function") {
+            applyAgenticStatusFromPayload(parsed);
+          }
+          const waitSec = Math.max(60, Number(parsed.retry_after_sec) || 0);
+          const waitMins = Math.max(1, Math.ceil(waitSec / 60));
+          const err = new Error(`Hermes 1.4 is at its shared daily rate limit - wait ~${waitMins} min or add your own Ollama API key in Customize to bypass.`);
+          err.code = "hermes_locked";
+          err.retryStatus = 429;
+          err.retryAfterSec = waitSec;
+          err.lockedUntilSec = Number(parsed.locked_until_sec) || 0;
+          err.userVisibleReason = "hermes_daily_cap";
+          throw err;
+        }
+      }
       throw new Error(errorText || `ROK request failed (${response.status || "unknown"}).`);
     }
     if (typeof applyThinkingQuotaFromHeaders === "function") applyThinkingQuotaFromHeaders(response);
     if (typeof applyDaedalusQuotaFromHeaders === "function") applyDaedalusQuotaFromHeaders(response);
+    // Refresh Hermes 1.4 lock state from X-Hermes-* response headers so the
+    // next /agentic attempt can short-circuit BEFORE hitting the rate limit
+    // again (the backend always re-emits these headers, including on a 200).
+    if (typeof applyAgenticLockFromHeaders === "function") applyAgenticLockFromHeaders(response);
 
     const processDataPayload = (payloadStr) => {
       if (!payloadStr || payloadStr === "[DONE]") return;
@@ -14202,8 +14311,13 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
         modelHint =
           ` Hermes 1.4 (gpt-oss:120b-cloud) hit its shared daily rate limit - wait about ${waitMins} minute${waitMins === 1 ? "" : "s"} or add your own Ollama API key in Customize to bypass the shared cap.`;
       } else {
+        // We're inside runAgenticCodeTask so the prior "use /agentic command"
+        // copy was misleading. State the real cause instead: Hermes 1.4
+        // returned zero tool calls and zero prose, which is unusual. Most
+        // likely either a short / vague prompt (handled by shortPromptHint
+        // above) or a transient provider hiccup. Suggest the simplest retry.
         modelHint =
-          ` \/agentic runs always use Hermes 1.4 (gpt-oss:120b-cloud). If you ran this from the regular chat composer, switch the model picker to Hermes and replay the request, or use the \/agentic command instead.`;
+          ` Hermes 1.4 (gpt-oss:120b-cloud) returned no tool calls and no text for this \/agentic run. Retry the request, or check \/api\/agentic\/status if the failure keeps happening.`;
       }
       summaryText =
         `No tool calls in ROK's reply — the model returned empty.` +
@@ -19070,6 +19184,22 @@ renderSandboxUI();
 bootstrapServerSession();
 refreshModelCatalogFromServer();
 refreshClientConfigFromServer();
+// Probe the shared Hermes 1.4 daily-cap state so the empty-reply hint can
+// show a real countdown (instead of "wait ~X minutes") on the first /agentic
+// attempt of a session. Best effort — never blocks app boot. Always
+// `preserveWhenUnlocked: true` because localStorage is the canonical cooldown
+// view for the user; a server probe that says "not locked yet" must NEVER
+// erase a lock that's still in its window (e.g. cross-tab state from a
+// previous session).
+refreshAgenticStatusFromServer({ preserveWhenUnlocked: true });
+// Also nudge every 60s so the cooldown count stays warm even when the user
+// is reading chat history without firing a new request.
+if (typeof setInterval === "function") {
+  setInterval(() => {
+    if (typeof isBanOverlayActive !== "undefined" && isBanOverlayActive) return;
+    refreshAgenticStatusFromServer({ preserveWhenUnlocked: true });
+  }, 60 * 1000);
+}
 applySidebarCollapsedState(true, { persist: false });
 if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
   mobileLayoutMediaQueryList = window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY);
