@@ -2525,6 +2525,13 @@ function getCustomOllamaModelValidationError(rawValue) {
 // Updated by refreshClientConfigFromServer() on boot and by applyThinkingQuotaFromHeaders()
 // after each chat response. The server enforces the real limit; this is UI-only.
 let serverThinkingQuota = { count: 0, limit: 10, exhausted: false, resetSec: 0, updatedAt: 0 };
+// Titan variable declaration MUST stay here — its assignment initialiser
+// (titanLockUntil = loadTitanLockUntilFromStorage() at module-load) and its
+// helpers (setTitanLockUntil, isTitanQuotaLocked, etc.) reference it from
+// the module-global scope. Lose this line and the page throws
+// ReferenceError: titanLockUntil is not defined at the first Titan helper
+// call (historically line ~2584 in the rendered build).
+let titanLockUntil = 0;
 // --- Hermes 1.4 daily-cap lock (shared Ollama cloud cap; BYOK bypasses it) ---
 // Mirrors the titan/daedalus lock pattern. Surge: Hermes hits a daily-rate
 // 429 when /api/chat goes through Ollama; the backend marks this session
@@ -13303,8 +13310,75 @@ function createToolCallsPanel(initialSummary = "") {
     }
   }
 
+  // Defensive sanitizer for the /agentic tool-trace summary line.
+  // ------------------------------------------------------------------
+  // Round-1 rewrote the empty-reply copy from "Make sure Hermes ...
+  // model picker — only Hermes has end-to-end native tool calling." to
+  // "Hermes 1.4 (gpt-oss:120b-cloud) returned no tool calls and no text
+  // for this /agentic run. ...". If a stale cached bundle slips through
+  // (or another future deploy accidentally reverts the copy), users were
+  // seeing the misleading "switch to Hermes" hint. This sanitizer runs
+  // once at the entry point of setSummary and neutralizes every known
+  // stale fragment I have shipped so the canonical current copy wins.
+  // It's intentionally a regex sweep rather than a full rewrite — the
+  // regex catches both old literal strings AND any variant wording the
+  // stale bundle tried to fall back to, so the user only ever sees the
+  // approved copy. Defense in depth: pair with cache-busting on deploy.
+  const AGENTIC_TRACE_SUMMARY_REWRITES = [
+    {
+      // Exact old copy from pre-round-1 builds (most specific, runs first).
+      match: /Make sure Hermes \(gpt-oss-120b-cloud[^)]*\), ROK's Ollama-cloud model\)? is selected in the model picker[^.]*\./i,
+      replace: "Hermes 1.4 (gpt-oss:120b-cloud) returned no tool calls and no text for this /agentic run. Retry the request, or check /api/agentic/status if the failure keeps happening."
+    },
+    {
+      // Generic fallback: any other "Make sure Hermes ..." sentence in the
+      // tool trace summary. This subsumes every variant wording the stale
+      // bundle might have shipped, so the canonical copy wins regardless
+      // of which Hermes alias the bundle referenced.
+      match: /Make sure Hermes[^.!?\n]{0,300}\.?/i,
+      replace: "Hermes 1.4 (gpt-oss:120b-cloud) returned no tool calls and no text for this /agentic run. Retry the request, or check /api/agentic/status if the failure keeps happening."
+    },
+    {
+      // Trailing fragment that can survive even if the lead-in was already
+      // swapped by an older bundle that half-applied the round-1 fix.
+      match: /only Hermes has[^.!?\n]*end-to-end native tool calling\.?/i,
+      replace: ""
+    },
+    {
+      // Cross-command nudges that don't belong inside an /agentic failure
+      // summary ("switch the model picker to Hermes", "use the /agentic
+      // command instead"). Both phrasings collapse to nothing so the
+      // summary line reads cleanly.
+      match: /switch the model picker to Hermes[^.!?\n]*\.?/i,
+      replace: ""
+    },
+    {
+      match: /use the \/agentic command instead\.?/i,
+      replace: ""
+    }
+  ];
+  function sanitizeAgenticTraceSummary(rawText) {
+    let cleaned = String(rawText == null ? "" : rawText);
+    if (!cleaned) return cleaned;
+    for (const rule of AGENTIC_TRACE_SUMMARY_REWRITES) {
+      cleaned = cleaned.replace(rule.match, rule.replace);
+    }
+    // Normalize dust left by the rewrites:
+    //   - double spaces from blank-string replacements
+    //   - comma-orphans left by rule 4/5 ("Hermes is fast, ." -> "Hermes is fast.")
+    //   - "word   ." or " . ." punctuation dust
+    cleaned = cleaned
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/[ \t]+\./g, ".")
+      .replace(/\s+\./g, ".")
+      .replace(/[,;:]\s*\./g, ".")
+      .replace(/\.\s*\./g, ".")
+      .trim();
+    return cleaned;
+  }
+
   function setSummary(html) {
-    const safe = String(html == null ? "" : html);
+    const safe = sanitizeAgenticTraceSummary(String(html == null ? "" : html));
     summaryText = safe;
     if (!safe) {
       summaryLine.hidden = true;
