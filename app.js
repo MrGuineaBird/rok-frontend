@@ -13636,7 +13636,7 @@ function hasSuccessfulFileMutationOutcome(outcomes = []) {
   return outcomes.some((outcome) => {
     if (!outcome || !outcome.ok) return false;
     const name = normalizeBuiltinToolName(outcome.name);
-    return name === "write_file" || name === "edit_file";
+    return (name === "write_file" || name === "edit_file") && outcome.changed !== false;
   });
 }
 
@@ -13703,71 +13703,36 @@ function getSingleSandboxFilePathFromOutcomes(outcomes = []) {
   return "";
 }
 
-function getRequestedCssColor(text = "") {
-  const value = String(text || "").toLowerCase();
-  const colors = {
-    blue: "#2563eb",
-    red: "#dc2626",
-    green: "#16a34a",
-    yellow: "#facc15",
-    purple: "#7c3aed",
-    pink: "#db2777",
-    orange: "#f97316",
-    black: "#111827",
-    white: "#f8fafc",
-    gray: "#64748b",
-    grey: "#64748b"
-  };
-  for (const [name, hex] of Object.entries(colors)) {
-    if (new RegExp(`\\b${name}\\b`, "i").test(value)) {
-      return { name, hex };
-    }
+function getSandboxFileContentByPath(path = "") {
+  const normalizedPath = normalizeSandboxFilePath(path);
+  if (!normalizedPath) return null;
+  try {
+    const sandbox = getCurrentSandboxState();
+    const file = sandbox && Array.isArray(sandbox.files)
+      ? sandbox.files.find((item) => item.path.toLowerCase() === normalizedPath.toLowerCase())
+      : null;
+    return file ? String(file.content || "") : null;
+  } catch (_) {
+    return null;
   }
-  const hexMatch = value.match(/#[0-9a-f]{3,8}\b/i);
-  if (hexMatch) return { name: hexMatch[0], hex: hexMatch[0] };
-  return null;
 }
 
-function replaceScopedColorValue(content = "", targetWord = "", colorHex = "") {
-  const target = String(targetWord || "").trim();
-  const replacement = String(colorHex || "").trim();
-  if (!target || !replacement) return { content: String(content || ""), replacements: 0 };
-  let nextContent = String(content || "");
-  let replacements = 0;
-  const colorValuePattern = "(?:#[0-9a-fA-F]{3,8}|rgb\\([^)]*\\)|rgba\\([^)]*\\)|hsl\\([^)]*\\)|hsla\\([^)]*\\)|green|limegreen|forestgreen|seagreen|darkgreen|lightgreen)";
-
-  const replaceWithCount = (pattern, replacer) => {
-    nextContent = nextContent.replace(pattern, (...args) => {
-      replacements++;
-      return typeof replacer === "function" ? replacer(...args) : replacer;
-    });
-  };
-
-  replaceWithCount(
-    new RegExp(`((?:${target})[\\w$-]*(?:color|fill|stroke|background)?\\s*[:=]\\s*["'\`])${colorValuePattern}(["'\`])`, "gi"),
-    (_match, prefix, suffix) => `${prefix}${replacement}${suffix}`
-  );
-
-  replaceWithCount(
-    new RegExp(`(\\.${target}[\\s\\S]{0,240}?(?:background|background-color|fill|stroke|color)\\s*:\\s*)${colorValuePattern}`, "gi"),
-    (_match, prefix) => `${prefix}${replacement}`
-  );
-
-  const lines = nextContent.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const nearby = lines.slice(Math.max(0, i - 4), Math.min(lines.length, i + 5)).join("\n");
-    if (!new RegExp(target, "i").test(nearby)) continue;
-    const changed = lines[i].replace(new RegExp(colorValuePattern, "gi"), replacement);
-    if (changed !== lines[i]) {
-      replacements += (lines[i].match(new RegExp(colorValuePattern, "gi")) || []).length;
-      lines[i] = changed;
-    }
-  }
-  nextContent = lines.join("\n");
-
-  return { content: nextContent, replacements };
-}
-
+// ---------------------------------------------------------------------------
+// Generic file-tool orchestration helpers (no game-specific code rewrites).
+//
+// These helpers exist solely to (a) detect no-op file writes, (b) refuse to
+// treat a bare list/read as a completed edit, and (c) auto-read the one
+// obvious file when a coding mutation request is in progress.
+//
+// RULES (do not regress):
+//   * This section must NEVER rewrite file content itself.
+//   * This section must NEVER hard-code patterns for any specific game,
+//     drawing API, color scheme, or third-party code base (no "pipe",
+//     "fillStyle", "strokeStyle", "pipeColor", "pipes.forEach", etc.).
+//   * Tool flow may only force another model/tool turn after a discovery
+//     step (read/list). Actual edits must come from the real file tools
+//     (edit_file / write_file) issued by the model.
+// ---------------------------------------------------------------------------
 function buildDeterministicFileMutationToolCall(outcomes = [], text = "", intent = null) {
   if (!shouldForceFileMutationContinuation(outcomes, text, intent)) return null;
   const targetPath = getSingleSandboxFilePathFromOutcomes(outcomes);
@@ -13783,27 +13748,7 @@ function buildDeterministicFileMutationToolCall(outcomes = [], text = "", intent
       }
     };
   }
-
-  const requestedColor = getRequestedCssColor(text);
-  if (!requestedColor) return null;
-  const targetWordMatch = String(text || "").toLowerCase().match(/\b(pipe|pipes|obstacle|obstacles|bird|player|background|ground)\b/);
-  const targetWord = targetWordMatch ? targetWordMatch[1].replace(/s$/, "") : "";
-  if (!targetWord) return null;
-
-  const sandbox = getCurrentSandboxState();
-  const file = sandbox.files.find((item) => item.path.toLowerCase() === targetPath.toLowerCase());
-  if (!file) return null;
-  const changed = replaceScopedColorValue(file.content, targetWord, requestedColor.hex);
-  if (!changed.replacements || changed.content === file.content) return null;
-
-  return {
-    id: `auto_write_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    type: "function",
-    function: {
-      name: "write_file",
-      arguments: JSON.stringify({ path: targetPath, content: changed.content })
-    }
-  };
+  return null;
 }
 
 function startGenerateImageTool(args = {}) {
@@ -15542,14 +15487,23 @@ async function send() {
                 args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
               } catch (_) { args = {}; }
 
+              const beforeMutationContent = (toolName === "write_file" || toolName === "edit_file")
+                ? getSandboxFileContentByPath(args.path || "")
+                : null;
               const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+              const afterMutationContent = (toolName === "write_file" || toolName === "edit_file")
+                ? getSandboxFileContentByPath(args.path || "")
+                : null;
+              const mutationChanged = (toolName === "write_file" || toolName === "edit_file")
+                ? beforeMutationContent !== afterMutationContent
+                : undefined;
               const callId = tc.id;
               const resultContent = toolResult.ok
                 ? JSON.stringify(toolResult.result)
                 : JSON.stringify({ error: toolResult.error });
 
               if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
-                fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+                fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result, changed: mutationChanged });
               }
 
               handleStatusUpdate(toolResult.ok
@@ -16004,14 +15958,23 @@ async function send() {
               args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
             } catch (_) { args = {}; }
 
+            const beforeMutationContent = (toolName === "write_file" || toolName === "edit_file")
+              ? getSandboxFileContentByPath(args.path || "")
+              : null;
             const toolResult = await executeBuiltinTool(toolName, args, activeBuiltinToolContext);
+            const afterMutationContent = (toolName === "write_file" || toolName === "edit_file")
+              ? getSandboxFileContentByPath(args.path || "")
+              : null;
+            const mutationChanged = (toolName === "write_file" || toolName === "edit_file")
+              ? beforeMutationContent !== afterMutationContent
+              : undefined;
             const callId = tc.id;
             const resultContent = toolResult.ok
               ? JSON.stringify(toolResult.result)
               : JSON.stringify({ error: toolResult.error });
 
             if (toolResult.ok && BUILTIN_FILE_TOOL_NAMES.has(toolName)) {
-              fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result });
+              fileToolOutcomes.push({ name: toolName, ok: true, result: toolResult.result, changed: mutationChanged });
             }
 
             handleStatusUpdate(toolResult.ok
