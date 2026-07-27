@@ -12475,6 +12475,25 @@ button.stop-mode:hover {
   color: #E36A6A;
 }
 
+.tool-calls-step[data-status="skipped"] {
+  color: #D8C9A8;
+}
+.tool-calls-step[data-status="skipped"] .tool-calls-step-icon {
+  background: rgba(196, 162, 78, 0.16);
+  border-color: rgba(196, 162, 78, 0.55);
+  color: #C4A24E;
+}
+.tool-calls-step[data-status="skipped"] .tool-calls-step-icon::before {
+  opacity: 0;
+  display: none;
+}
+.tool-calls-step[data-status="skipped"] .tool-calls-step-icon::after {
+  content: "\2013";
+  font-size: 12px;
+  font-weight: 800;
+  color: #C4A24E;
+}
+
 @keyframes tool-calls-spin {
   to { transform: rotate(360deg); }
 }

@@ -10979,14 +10979,35 @@ function renderConversation(messages) {
     if (item.role === "assistant" && item.evidence) {
       historyEntry.evidence = item.evidence;
     }
+    if (item.role === "assistant" && item.toolSnapshot) {
+      historyEntry.toolSnapshot = item.toolSnapshot;
+    }
     history.push(historyEntry);
     const displayRole = item.role === "assistant" ? "bot" : "user";
     const renderStoryCanvas = item.role === "assistant" && looksLikeStoryText(item.content);
+    const toolSnapshot = item.role === "assistant" ? item.toolSnapshot || null : null;
     const rendered = addMessage(displayRole, item.content, {
       markdown: item.role === "assistant" && !renderStoryCanvas,
       storyCanvas: renderStoryCanvas,
-      evidence: item.role === "assistant" ? item.evidence || null : null
+      evidence: item.role === "assistant" ? item.evidence || null : null,
+      toolTrace: Boolean(toolSnapshot),
+      toolTraceSummary: toolSnapshot && toolSnapshot.summary ? toolSnapshot.summary : (item.role === "assistant" ? item.content : "")
     });
+    // Rehydrate the tool-caller UI from a persisted snapshot so reloaded
+    // sessions show the same "Done \u25be" panel with the same steps.
+    if (toolSnapshot && rendered.toolController) {
+      if (toolSnapshot.header) {
+        rendered.toolController.setHeader(toolSnapshot.header);
+      }
+      const steps = Array.isArray(toolSnapshot.steps) ? toolSnapshot.steps : [];
+      for (const step of steps) {
+        rendered.toolController.addStep({
+          label: step.label || "Tool",
+          status: step.status || "done",
+          meta: step.meta || ""
+        });
+      }
+    }
     if (renderStoryCanvas && rendered.storyCanvas) {
       updateStoryCanvasOutput(rendered.storyCanvas, item.content);
       rendered.storyCanvas.setStatus("Complete");
@@ -15058,6 +15079,8 @@ async function send() {
   let storyCanvas = null;
   let thinkingPanel = null;
   let workTracePanel = null;
+  let toolCallsPanel = null;
+  let toolController = null;
   let partialText = "";
   let thinkingText = "";
   let thinkTagCarry = "";
@@ -15100,12 +15123,18 @@ async function send() {
       storyCanvas: useStoryCanvas,
       thinkingBlock: true,
       workTrace: true,
+      toolTrace: true,
       showTypingDots: true
     });
     bubble = mounted.bubble;
     storyCanvas = mounted.storyCanvas;
     thinkingPanel = mounted.thinkingPanel;
     workTracePanel = mounted.workTracePanel;
+    toolCallsPanel = mounted.toolCallsPanel;
+    toolController = mounted.toolController || mounted.toolCallsPanel;
+    if (toolController) {
+      toolController.setHeader("Working");
+    }
     typingIndicator = mounted.typingIndicator;
     if (requestShouldThink) {
       showThinkingAvatar();
@@ -15227,6 +15256,70 @@ async function send() {
       item.node.classList.add("is-done");
     }
     workTracePanel.title.textContent = "Done";
+  };
+
+  // ---------------------------------------------------------------------
+  // appendToolCallStep — smart router that mirrors the legacy
+  // appendWorkTraceStep call into the new Claude-Code-style
+  // .tool-calls-block UI. If a step with the same key already exists,
+  // we update it (status / label / meta) instead of duplicating.
+  // Safe to call before toolCallsPanel exists — just delegates to the
+  // legacy work-trace panel.
+  // ---------------------------------------------------------------------
+  const toolStepKeys = new Map(); // key -> stepId in the new panel
+  const appendToolCallStep = (label, options = {}) => {
+    const normalizedLabel = normalizeWorkTraceLabel(label) || String(label || "");
+    const key = String(options.key || normalizedLabel).toLowerCase();
+    const status = String(options.status || "pending");
+    const meta = String(options.meta || options.detail || "");
+    // 1) Legacy work-trace (keeps the old UI working).
+    appendWorkTraceStep(label, { key, detail: options.detail });
+    if (!toolController || !normalizedLabel) return;
+    // 2) New .tool-calls-block.
+    const existingId = toolStepKeys.get(key);
+    if (existingId) {
+      toolController.updateStep(existingId, {
+        status,
+        label: normalizedLabel,
+        meta
+      });
+      return;
+    }
+    const id = toolController.addStep({
+      label: normalizedLabel,
+      status,
+      meta
+    });
+    if (id) toolStepKeys.set(key, id);
+  };
+  const setToolTraceHeader = (text) => {
+    if (toolController) toolController.setHeader(text);
+  };
+  const setToolTraceSummary = (text) => {
+    if (toolController) toolController.setSummary(text);
+  };
+  // finalizeToolTrace — once the streaming + tool loop is done, flip the
+  // header to "Done" (or "Stopped" if the user aborted) and stamp an
+  // aggregate summary like "Ran 3/4 tools." ONLY if the assistant hasn't
+  // already produced text we can surface as the summary — otherwise we'd
+  // overwrite the user's actual reply with generic noise.
+  const finalizeToolTrace = () => {
+    if (!toolController || !toolCallsPanel) return;
+    const doneCount = (toolCallsPanel.steps || []).filter(
+      (s) => s.node && s.node.dataset && s.node.dataset.status === "done"
+    ).length;
+    const totalCount = (toolCallsPanel.steps || []).length;
+    const aborted = Boolean(typeof stopRequested !== "undefined" && stopRequested);
+    setToolTraceHeader(aborted ? "Stopped" : "Done");
+    const summaryLineAlreadySet = toolCallsPanel.summaryLine && !toolCallsPanel.summaryLine.hidden;
+    const hasAssistantReply = String(partialText || "").trim().length > 0;
+    if (!summaryLineAlreadySet && !hasAssistantReply && totalCount > 0) {
+      setToolTraceSummary(
+        aborted
+          ? `Stopped after ${doneCount}/${totalCount} tools.`
+          : `Ran ${doneCount}/${totalCount} tools.`
+      );
+    }
   };
   const handleWorkTraceEvent = (work) => {
     if (!work || typeof work !== "object") return;
@@ -15534,8 +15627,20 @@ async function send() {
         appendWorkTraceStep(`Ignored ${toolName.replace(/_/g, " ")}`, {
           detail: "That tool is not enabled for this request."
         });
+        appendToolCallStep(`Ignored ${toolName.replace(/_/g, " ")}`, {
+          key: `tc-${toolCallId}`,
+          status: "error",
+          detail: "That tool is not enabled for this request."
+        });
         continue;
       }
+      // Live wire the new tool-caller UI: mark this call as pending
+      // immediately so the user sees it land in real time during streaming.
+      appendToolCallStep(`Working on ${toolName.replace(/_/g, " ")}`, {
+        key: `tc-${toolCallId}`,
+        status: "pending",
+        meta: ""
+      });
       pendingToolCalls.push({ ...tc, id: toolCallId, _assistantContent: visibleAssistantContent });
     }
     console.log("Pending tool calls after processing:", pendingToolCalls.length);
@@ -15763,7 +15868,7 @@ async function send() {
         setBubbleContent(bubble, chatSummary, true);
         attachEvidenceToAssistantBubble(bubble, finalEvidence);
       }
-      history.push({ role: "assistant", content: chatSummary, evidence: finalEvidence });
+      history.push({ role: "assistant", content: chatSummary, evidence: finalEvidence, toolSnapshot: toolCallsPanel ? toolCallsPanel.snapshot() : null });
       pushSandboxConversationMessage("assistant", chatSummary);
       trimHistoryToLimit();
       syncCurrentSessionFromHistory();
@@ -15999,8 +16104,16 @@ async function send() {
           if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
             const deterministicToolCall = buildDeterministicFileMutationToolCall(fileToolOutcomes, text, intent);
             if (deterministicToolCall) {
+              // Surface this synthetic follow-up call in the live tool-caller UI
+              // so the user sees why the agent loop is running another round.
+              const detName = getNormalizedToolCallName(deterministicToolCall) || "unknown";
+              appendToolCallStep(`Working on ${detName.replace(/_/g, " ")}`, {
+                key: `tc-${deterministicToolCall.id || ("det-" + toolLoopCount)}`,
+                status: "pending",
+                meta: ""
+              });
               pendingToolCalls.push(deterministicToolCall);
-              handleStatusUpdate(`Working on ${getNormalizedToolCallName(deterministicToolCall).replace(/_/g, " ")}...`);
+              handleStatusUpdate(`Working on ${detName.replace(/_/g, " ")}...`);
             } else {
               forcedMutationFollowups++;
               toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
@@ -16038,6 +16151,17 @@ async function send() {
                 args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
               } catch (_) { args = {}; }
 
+              const callId = tc.id;
+              const friendlyName = toolName.replace(/_/g, " ");
+
+              // Flip the new .tool-calls-block step to "running" right before
+              // dispatch, and to "done" / "error" once executeBuiltinTool resolves.
+              appendToolCallStep(`Running ${friendlyName}`, {
+                key: `tc-${callId}`,
+                status: "running",
+                meta: args && args.path ? args.path : ""
+              });
+
               const beforeMutationContent = (toolName === "write_file" || toolName === "edit_file")
                 ? getSandboxFileContentByPath(args.path || "")
                 : null;
@@ -16048,7 +16172,6 @@ async function send() {
               const mutationChanged = (toolName === "write_file" || toolName === "edit_file")
                 ? beforeMutationContent !== afterMutationContent
                 : undefined;
-              const callId = tc.id;
               const resultContent = toolResult.ok
                 ? JSON.stringify(toolResult.result)
                 : JSON.stringify({ error: toolResult.error });
@@ -16058,10 +16181,24 @@ async function send() {
               }
 
               handleStatusUpdate(toolResult.ok
-                ? `Ran ${toolName.replace(/_/g, " ")}`
-                : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
+                ? `Ran ${friendlyName}`
+                : (toolResult.skipped ? `Skipped ${friendlyName}` : `Tool ${friendlyName} failed`));
+
+              appendToolCallStep(
+                toolResult.ok
+                  ? `Ran ${friendlyName}`
+                  : (toolResult.skipped ? `Skipped ${friendlyName}` : `${friendlyName} failed`),
+                {
+                  key: `tc-${callId}`,
+                  status: toolResult.ok ? "done" : (toolResult.skipped ? "done" : "error"),
+                  meta: toolResult.ok
+                    ? (args && args.path ? args.path : "")
+                    : (toolResult.error ? String(toolResult.error).slice(0, 60) : "")
+                }
+              );
+
               if (toolResult.skipped) {
-                appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
+                appendWorkTraceStep(`Skipped ${friendlyName}`, { detail: toolResult.error || "Not appropriate for this request." });
               }
 
               toolHistory.push({
@@ -16235,7 +16372,12 @@ async function send() {
           addRegenerateButton(bubble);
         }
         attachEvidenceToAssistantBubble(bubble, finalEvidence);
-        history.push({ role: "assistant", content: partialText, evidence: finalEvidence });
+        history.push({ role: "assistant", content: partialText, evidence: finalEvidence, toolSnapshot: toolCallsPanel ? toolCallsPanel.snapshot() : null });
+        // Finalize the new tool-caller UI: flip header to "Done" (or
+        // "Stopped" if the user aborted mid-loop) and stamp a summary.
+        if (toolCallsPanel) {
+          finalizeToolTrace();
+        }
         trimHistoryToLimit();
         syncCurrentSessionFromHistory();
         addCorrectMeButton(bubble);
@@ -16509,6 +16651,16 @@ async function send() {
               args = typeof argsRaw === "string" ? JSON.parse(argsRaw) : (argsRaw || {});
             } catch (_) { args = {}; }
 
+            const callId = tc.id;
+            const friendlyName = toolName.replace(/_/g, " ");
+
+            // Live wire the new .tool-calls-block step to running/done.
+            appendToolCallStep(`Running ${friendlyName}`, {
+              key: `tc-${callId}`,
+              status: "running",
+              meta: args && args.path ? args.path : ""
+            });
+
             const beforeMutationContent = (toolName === "write_file" || toolName === "edit_file")
               ? getSandboxFileContentByPath(args.path || "")
               : null;
@@ -16519,7 +16671,6 @@ async function send() {
             const mutationChanged = (toolName === "write_file" || toolName === "edit_file")
               ? beforeMutationContent !== afterMutationContent
               : undefined;
-            const callId = tc.id;
             const resultContent = toolResult.ok
               ? JSON.stringify(toolResult.result)
               : JSON.stringify({ error: toolResult.error });
@@ -16529,10 +16680,24 @@ async function send() {
             }
 
             handleStatusUpdate(toolResult.ok
-              ? `Ran ${toolName.replace(/_/g, " ")}`
-              : (toolResult.skipped ? `Skipped ${toolName.replace(/_/g, " ")}` : `Tool ${toolName.replace(/_/g, " ")} failed`));
+              ? `Ran ${friendlyName}`
+              : (toolResult.skipped ? `Skipped ${friendlyName}` : `Tool ${friendlyName} failed`));
+
+            appendToolCallStep(
+              toolResult.ok
+                ? `Ran ${friendlyName}`
+                : (toolResult.skipped ? `Skipped ${friendlyName}` : `${friendlyName} failed`),
+              {
+                key: `tc-${callId}`,
+                status: toolResult.ok ? "done" : (toolResult.skipped ? "skipped" : "error"),
+                meta: toolResult.ok
+                  ? (args && args.path ? args.path : "")
+                  : (toolResult.error ? String(toolResult.error).slice(0, 60) : "")
+              }
+            );
+
             if (toolResult.skipped) {
-              appendWorkTraceStep(`Skipped ${toolName.replace(/_/g, " ")}`, { detail: toolResult.error || "Not appropriate for this request." });
+              appendWorkTraceStep(`Skipped ${friendlyName}`, { detail: toolResult.error || "Not appropriate for this request." });
             }
 
             toolHistory.push({
@@ -16695,7 +16860,12 @@ async function send() {
         addRegenerateButton(bubble);
       }
       attachEvidenceToAssistantBubble(bubble, finalEvidence);
-      history.push({ role: "assistant", content: partialText, evidence: finalEvidence });
+      history.push({ role: "assistant", content: partialText, evidence: finalEvidence, toolSnapshot: toolCallsPanel ? toolCallsPanel.snapshot() : null });
+        // Finalize the new tool-caller UI: flip header to "Done" (or
+        // "Stopped" if the user aborted mid-loop) and stamp a summary.
+        if (toolCallsPanel) {
+          finalizeToolTrace();
+        }
       trimHistoryToLimit();
       syncCurrentSessionFromHistory();
       addCorrectMeButton(bubble);
@@ -16744,7 +16914,12 @@ async function send() {
             addRegenerateButton(bubble);
           }
           attachEvidenceToAssistantBubble(bubble, finalEvidence);
-          history.push({ role: "assistant", content: partialText, evidence: finalEvidence });
+          history.push({ role: "assistant", content: partialText, evidence: finalEvidence, toolSnapshot: toolCallsPanel ? toolCallsPanel.snapshot() : null });
+        // Finalize the new tool-caller UI: flip header to "Done" (or
+        // "Stopped" if the user aborted mid-loop) and stamp a summary.
+        if (toolCallsPanel) {
+          finalizeToolTrace();
+        }
           trimHistoryToLimit();
           syncCurrentSessionFromHistory();
           addCorrectMeButton(bubble);
