@@ -13553,7 +13553,7 @@ function applyBuiltinToolsToRequestBody(requestBody, text = "", intent = null) {
 }
 
 const BUILTIN_TOOL_MAX_LOOP = 5;
-const BUILTIN_TOOL_FOLLOWUP_MESSAGE = "Continue from the tool results above. Briefly confirm what you created or changed.";
+const BUILTIN_TOOL_FOLLOWUP_MESSAGE = "The tool results are above. Use them to complete the user's request. If you need to make more changes, call additional tools. Otherwise, provide a clear response to the user.";
 
 const BUILTIN_FILE_TOOL_NAMES = new Set(["list_files", "read_file", "write_file", "edit_file"]);
 
@@ -13591,9 +13591,9 @@ function summarizeFileToolOutcomes(outcomes = []) {
       const storageLabel = outcome.result.storage === "disk" ? " on disk" : " in browser storage";
       lines.push(`${action} \`${outcome.result.path}\`${storageLabel} (${outcome.result.lines || 0} lines).`);
     } else if (name === "edit_file") {
-      lines.push(`Edited \`${outcome.result.path}\`.`);
+      lines.push(`Edited \`${outcome.result.path}\` (${outcome.result.replacements || 1} replacement${(outcome.result.replacements || 1) !== 1 ? 's' : ''}).`);
     } else if (name === "read_file") {
-      lines.push(`Read \`${outcome.result.path}\`.`);
+      lines.push(`Read \`${outcome.result.path}\` (${outcome.result.lines || 0} lines).`);
     } else if (name === "list_files") {
       const count = Number(outcome.result.count) || 0;
       lines.push(`Listed ${count} workspace file${count === 1 ? "" : "s"}.`);
@@ -15386,7 +15386,18 @@ async function send() {
               }
             });
 
-            if (!followupRes.ok) break;
+            if (!followupRes.ok) {
+            console.log("Tool follow-up request failed with status:", followupRes.status);
+            // Don't break immediately - try to provide a fallback response
+            if (!String(partialText || "").trim()) {
+              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              if (fallbackReply) {
+                partialText = fallbackReply;
+                noteAnswerStarted();
+              }
+            }
+            break;
+          }
 
             const followupContentType = (followupRes.headers.get("content-type") || "").toLowerCase();
             applyThinkingQuotaFromHeaders(followupRes);
@@ -15447,10 +15458,26 @@ async function send() {
                   if (fParsed.agent_loop) { handleAgentLoopEvent(fParsed.agent_loop); }
                 }
               }
+            } catch (followupErr) {
+            console.log("Tool follow-up streaming error:", followupErr);
+            // Continue processing even if streaming fails
+            if (!String(partialText || "").trim()) {
+              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              if (fallbackReply) {
+                partialText = fallbackReply;
+                noteAnswerStarted();
+              }
             }
-          } catch (followupErr) {
-            if (followupErr && followupErr.name !== "AbortError") {
-              console.log("Tool follow-up error:", followupErr);
+          }
+          if (!followupRes.ok) {
+            console.log("Tool follow-up request failed with status:", followupRes.status);
+            // Don't break immediately - try to provide a fallback response
+            if (!String(partialText || "").trim()) {
+              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              if (fallbackReply) {
+                partialText = fallbackReply;
+                noteAnswerStarted();
+              }
             }
             break;
           }
@@ -15808,7 +15835,18 @@ async function send() {
               handleStatusUpdate(formatAutoRetryStatusText(error, attempt, totalAttempts, "ROK"));
             }
           });
-          if (!followupRes.ok) break;
+          if (!followupRes.ok) {
+            console.log("Tool follow-up request failed with status:", followupRes.status);
+            // Don't break immediately - try to provide a fallback response
+            if (!String(partialText || "").trim()) {
+              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              if (fallbackReply) {
+                partialText = fallbackReply;
+                noteAnswerStarted();
+              }
+            }
+            break;
+          }
 
           applyThinkingQuotaFromHeaders(followupRes);
           applyDaedalusQuotaFromHeaders(followupRes);
@@ -15860,7 +15898,17 @@ async function send() {
             }
           }
         } catch (fErr) {
-          if (fErr && fErr.name !== "AbortError") console.log("Tool follow-up error:", fErr);
+          if (fErr && fErr.name !== "AbortError") {
+            console.log("Tool follow-up error:", fErr);
+            // Don't break immediately - try to provide a fallback response
+            if (!String(partialText || "").trim()) {
+              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              if (fallbackReply) {
+                partialText = fallbackReply;
+                noteAnswerStarted();
+              }
+            }
+          }
           break;
         }
       }
