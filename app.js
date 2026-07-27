@@ -13671,6 +13671,141 @@ function buildFileMutationContinuationMessage(text = "") {
   ].filter(Boolean).join(" ");
 }
 
+function getLastSuccessfulFileOutcome(outcomes = [], toolName = "") {
+  const normalizedToolName = normalizeBuiltinToolName(toolName);
+  for (let i = outcomes.length - 1; i >= 0; i--) {
+    const outcome = outcomes[i];
+    if (!outcome || !outcome.ok || !outcome.result) continue;
+    if (normalizedToolName && normalizeBuiltinToolName(outcome.name) !== normalizedToolName) continue;
+    return outcome;
+  }
+  return null;
+}
+
+function getSingleSandboxFilePathFromOutcomes(outcomes = []) {
+  const readOutcome = getLastSuccessfulFileOutcome(outcomes, "read_file");
+  if (readOutcome && readOutcome.result && readOutcome.result.path) {
+    return normalizeSandboxFilePath(readOutcome.result.path);
+  }
+  const listOutcome = getLastSuccessfulFileOutcome(outcomes, "list_files");
+  const listedFiles = listOutcome && listOutcome.result && Array.isArray(listOutcome.result.files)
+    ? listOutcome.result.files
+    : [];
+  if (listedFiles.length === 1 && listedFiles[0] && listedFiles[0].path) {
+    return normalizeSandboxFilePath(listedFiles[0].path);
+  }
+  try {
+    const sandbox = getCurrentSandboxState();
+    if (sandbox && Array.isArray(sandbox.files) && sandbox.files.length === 1) {
+      return normalizeSandboxFilePath(sandbox.files[0].path);
+    }
+  } catch (_) {}
+  return "";
+}
+
+function getRequestedCssColor(text = "") {
+  const value = String(text || "").toLowerCase();
+  const colors = {
+    blue: "#2563eb",
+    red: "#dc2626",
+    green: "#16a34a",
+    yellow: "#facc15",
+    purple: "#7c3aed",
+    pink: "#db2777",
+    orange: "#f97316",
+    black: "#111827",
+    white: "#f8fafc",
+    gray: "#64748b",
+    grey: "#64748b"
+  };
+  for (const [name, hex] of Object.entries(colors)) {
+    if (new RegExp(`\\b${name}\\b`, "i").test(value)) {
+      return { name, hex };
+    }
+  }
+  const hexMatch = value.match(/#[0-9a-f]{3,8}\b/i);
+  if (hexMatch) return { name: hexMatch[0], hex: hexMatch[0] };
+  return null;
+}
+
+function replaceScopedColorValue(content = "", targetWord = "", colorHex = "") {
+  const target = String(targetWord || "").trim();
+  const replacement = String(colorHex || "").trim();
+  if (!target || !replacement) return { content: String(content || ""), replacements: 0 };
+  let nextContent = String(content || "");
+  let replacements = 0;
+  const colorValuePattern = "(?:#[0-9a-fA-F]{3,8}|rgb\\([^)]*\\)|rgba\\([^)]*\\)|hsl\\([^)]*\\)|hsla\\([^)]*\\)|green|limegreen|forestgreen|seagreen|darkgreen|lightgreen)";
+
+  const replaceWithCount = (pattern, replacer) => {
+    nextContent = nextContent.replace(pattern, (...args) => {
+      replacements++;
+      return typeof replacer === "function" ? replacer(...args) : replacer;
+    });
+  };
+
+  replaceWithCount(
+    new RegExp(`((?:${target})[\\w$-]*(?:color|fill|stroke|background)?\\s*[:=]\\s*["'\`])${colorValuePattern}(["'\`])`, "gi"),
+    (_match, prefix, suffix) => `${prefix}${replacement}${suffix}`
+  );
+
+  replaceWithCount(
+    new RegExp(`(\\.${target}[\\s\\S]{0,240}?(?:background|background-color|fill|stroke|color)\\s*:\\s*)${colorValuePattern}`, "gi"),
+    (_match, prefix) => `${prefix}${replacement}`
+  );
+
+  const lines = nextContent.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const nearby = lines.slice(Math.max(0, i - 4), Math.min(lines.length, i + 5)).join("\n");
+    if (!new RegExp(target, "i").test(nearby)) continue;
+    const changed = lines[i].replace(new RegExp(colorValuePattern, "gi"), replacement);
+    if (changed !== lines[i]) {
+      replacements += (lines[i].match(new RegExp(colorValuePattern, "gi")) || []).length;
+      lines[i] = changed;
+    }
+  }
+  nextContent = lines.join("\n");
+
+  return { content: nextContent, replacements };
+}
+
+function buildDeterministicFileMutationToolCall(outcomes = [], text = "", intent = null) {
+  if (!shouldForceFileMutationContinuation(outcomes, text, intent)) return null;
+  const targetPath = getSingleSandboxFilePathFromOutcomes(outcomes);
+  if (!targetPath) return null;
+  const hasRead = Boolean(getLastSuccessfulFileOutcome(outcomes, "read_file"));
+  if (!hasRead) {
+    return {
+      id: `auto_read_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      type: "function",
+      function: {
+        name: "read_file",
+        arguments: JSON.stringify({ path: targetPath })
+      }
+    };
+  }
+
+  const requestedColor = getRequestedCssColor(text);
+  if (!requestedColor) return null;
+  const targetWordMatch = String(text || "").toLowerCase().match(/\b(pipe|pipes|obstacle|obstacles|bird|player|background|ground)\b/);
+  const targetWord = targetWordMatch ? targetWordMatch[1].replace(/s$/, "") : "";
+  if (!targetWord) return null;
+
+  const sandbox = getCurrentSandboxState();
+  const file = sandbox.files.find((item) => item.path.toLowerCase() === targetPath.toLowerCase());
+  if (!file) return null;
+  const changed = replaceScopedColorValue(file.content, targetWord, requestedColor.hex);
+  if (!changed.replacements || changed.content === file.content) return null;
+
+  return {
+    id: `auto_write_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    type: "function",
+    function: {
+      name: "write_file",
+      arguments: JSON.stringify({ path: targetPath, content: changed.content })
+    }
+  };
+}
+
 function startGenerateImageTool(args = {}) {
   const prompt = normalizeImageToolPromptFragment(args.prompt || args.description || args.subject || "");
   if (!prompt) {
@@ -15366,9 +15501,15 @@ async function send() {
         ) {
           toolLoopCount++;
           if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
-            forcedMutationFollowups++;
-            toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
-            handleStatusUpdate("Continuing file edit...");
+            const deterministicToolCall = buildDeterministicFileMutationToolCall(fileToolOutcomes, text, intent);
+            if (deterministicToolCall) {
+              pendingToolCalls.push(deterministicToolCall);
+              handleStatusUpdate(`Working on ${getNormalizedToolCallName(deterministicToolCall).replace(/_/g, " ")}...`);
+            } else {
+              forcedMutationFollowups++;
+              toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
+              handleStatusUpdate("Continuing file edit...");
+            }
           }
           const callsToExecute = pendingToolCalls.map((tc) => {
             const toolCallId = tc && tc.id
@@ -15824,9 +15965,15 @@ async function send() {
       ) {
         toolLoopCount++;
         if (pendingToolCalls.length === 0 && shouldForceFileMutationContinuation(fileToolOutcomes, text, intent)) {
-          forcedMutationFollowups++;
-          toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
-          handleStatusUpdate("Continuing file edit...");
+          const deterministicToolCall = buildDeterministicFileMutationToolCall(fileToolOutcomes, text, intent);
+          if (deterministicToolCall) {
+            pendingToolCalls.push(deterministicToolCall);
+            handleStatusUpdate(`Working on ${getNormalizedToolCallName(deterministicToolCall).replace(/_/g, " ")}...`);
+          } else {
+            forcedMutationFollowups++;
+            toolHistory.push({ role: "user", content: buildFileMutationContinuationMessage(text) });
+            handleStatusUpdate("Continuing file edit...");
+          }
         }
         const callsToExecute = pendingToolCalls.map((tc) => {
           const toolCallId = tc && tc.id
