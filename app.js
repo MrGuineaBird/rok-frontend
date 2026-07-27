@@ -14349,6 +14349,99 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
           status: failed.length === 0 ? "done" : (written.length === 0 ? "error" : "running"),          meta: "fallback wrote " + written.length
         });
       }
+      // =================================================================
+      // JSON tool_calls safety net — parallels the <rok_file> fallback above.
+      // Hermes 1.4 (gpt-oss:120b-cloud) sometimes wraps an OpenAI-style
+      // tool_calls JSON block in plain prose instead of emitting it via the
+      // native tool_calls SSE field. When that happens, extract the calls out
+      // of fullText and run them through the same executeBackendFileTool
+      // pipeline (write_file / edit_file / read_file / list_files).
+      // Cross-dedups against toolCallsFingerprints so a call already captured
+      // natively isn't executed twice. Caps at AGENTIC_MAX_TOOL_CALLS_PER_REQUEST
+      // to keep browser localStorage bounded.
+      // =================================================================
+      if (fullText && fullText.indexOf('"tool_calls"') !== -1) {
+        let safetyCount = 0;
+        const seenSafetyFps = new Set();
+        try {
+          const extractedCalls = extractJsonToolCallsFromProse(fullText);
+          for (const tc of extractedCalls) {
+            if (safetyCount >= AGENTIC_MAX_TOOL_CALLS_PER_REQUEST) break;
+            if (!tc || typeof tc !== "object") continue;
+            const fn = tc.function || {};
+            const toolName = String(fn.name || "").trim();
+            if (!toolName) continue;
+            let args = {};
+            if (typeof fn.arguments === "string") {
+              try { args = JSON.parse(fn.arguments) || {}; } catch (_) { args = {}; }
+            } else if (fn.arguments && typeof fn.arguments === "object") {
+              args = fn.arguments;
+            }
+            // Dedup fingerprint must mirror the native pipeline at line ~14145 so a
+            // call that already arrived natively is recognized and skipped here.
+            let argsKey;
+            try { argsKey = JSON.stringify(args); } catch (_) { argsKey = String(args); }
+            const fp = `${toolName}#${argsKey}`;
+            if (seenSafetyFps.has(fp) || toolCallsFingerprints.has(fp)) continue;
+            // Path safety for write_file / edit_file — same rules as the <rok_file>
+            // markup fallback above (no `..`, no leading `/`, only [A-Za-z0-9_./-]+,
+            // must have an extension). Defense in depth so a confused model can't
+            // try to escape the workspace via the JSON-in-prose fallback.
+            const safePath = (toolName === "write_file" || toolName === "edit_file")
+              ? String(args.path || "")
+              : "";
+            if (safePath) {
+              if (safePath.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) continue;
+              if (!/^[A-Za-z0-9_./-]+$/.test(safePath)) continue;
+              if (!/\.[A-Za-z0-9]{1,6}$/.test(safePath)) continue;
+            }
+            seenSafetyFps.add(fp);
+            toolCallsFingerprints.add(fp);
+            safetyCount++;
+            const argPreview = safePath || (Object.keys(args).slice(0, 2).join(", ") || "(no args)");
+            const idSafety = controller.addStep({
+              label: toolName === "write_file" ? "write_file"
+                : toolName === "edit_file" ? "edit_file"
+                : toolName === "read_file" ? "read_file"
+                : toolName === "list_files" ? "list_files"
+                : (toolName || "tool"),
+              status: "running",
+              meta: argPreview.slice(0, 60)
+            });
+            try {
+              const result = await executeBackendFileTool(toolName, args);
+              if (result && result.ok) {
+                controller.updateStep(idSafety, { status: "done", meta: (result.result && result.result.path) || argPreview });
+                if ((toolName === "write_file" || toolName === "edit_file") && args && args.path) {
+                  written.push({
+                    path: args.path,
+                    lines: (result.result && (result.result.lines || result.result.newLines)) || 0
+                  });
+                }
+              } else {
+                controller.updateStep(idSafety, { status: "error", meta: ((result && result.error) || "tool call failed").slice(0, 60) });
+                if (args && args.path) {
+                  failed.push({ path: args.path, error: (result && result.error) || "tool call failed" });
+                }
+              }
+            } catch (e) {
+              controller.updateStep(idSafety, { status: "error", meta: String((e && e.message) || e).slice(0, 60) });
+              if (args && args.path) {
+                failed.push({ path: args.path, error: String((e && e.message) || e) });
+              }
+            }
+          }
+          if (written.length > 0) {
+            controller.updateStep(idWrite, {
+              status: failed.length === 0 ? "done" : (written.length === 0 ? "error" : "running"),
+              meta: `safety-net wrote ${written.length}`
+            });
+          }
+        } catch (_) {
+          // Defensive: extractor or downstream code may throw on malformed prose;
+          // never let it crash runAgenticCodeTask's trace panel.
+        }
+      }
     }
 
   // 5) Compose the summary line that lands under the trace.
@@ -14430,6 +14523,79 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
     files: written,
     failed
   };
+}
+
+// extractJsonToolCallsFromProse — locate an OpenAI-style tool_calls JSON
+// block inside plain text. Hermes 1.4 (gpt-oss:120b-cloud) sometimes emits
+// tool_calls as JSON-as-prose instead of using the native tool_calls SSE
+// field. Defensive parser: tolerates ```json``` code fences and prose around
+// the JSON block, ignores truncated / malformed blocks, never throws.
+function extractJsonToolCallsFromProse(rawText) {
+  const text = String(rawText || "");
+  if (!text) return [];
+  const candidates = [];
+  // 1. Code-fence wrapped JSON (with optional `json` language tag).
+  const fenceRe = /```(?:json|JSON)?\s*(\{[\s\S]*?\})\s*```/g;
+  let fm;
+  while ((fm = fenceRe.exec(text)) !== null) candidates.push(fm[1]);
+  // 2. Brace-balanced JSON block preceding the "tool_calls" key. The walk is
+  // string-aware so braces / quotes inside an "arguments" string don't throw
+  // off the depth count; a sole backslash escapes the next char.
+  const tcIdx = text.indexOf('"tool_calls"');
+  if (tcIdx > -1) {
+    let openIdx = -1;
+    for (let i = tcIdx; i >= 0; i--) {
+      if (text[i] === "{") { openIdx = i; break; }
+    }
+    if (openIdx >= 0) {
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      let closeIdx = -1;
+      for (let j = openIdx; j < text.length; j++) {
+        const c = text[j];
+        if (escape) { escape = false; continue; }
+        if (c === "\\") { escape = true; continue; }
+        if (c === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) { closeIdx = j; break; }
+        }
+      }
+      if (closeIdx > openIdx) candidates.push(text.slice(openIdx, closeIdx + 1));
+    }
+  }
+  // Try each candidate; return the first that parses AND has tool_calls.
+  for (const candidate of candidates) {
+    let parsed;
+    try { parsed = JSON.parse(candidate); } catch (_) { continue; }
+    const calls = Array.isArray(parsed && parsed.tool_calls)
+      ? parsed.tool_calls
+      : (Array.isArray(parsed && parsed.message && parsed.message.tool_calls) ? parsed.message.tool_calls : null);
+    if (calls && calls.length) {
+      // Normalize each tool_call into the native shape so the existing
+      // executeBackendFileTool pipeline picks it up unchanged.
+      return calls.map((tc) => {
+        if (!tc || typeof tc !== "object") return null;
+        const fn = tc.function || {};
+        return {
+          id: String(tc.id || ""),
+          type: String(tc.type || "function"),
+          function: {
+            name: String(fn.name || "").trim(),
+            arguments: typeof fn.arguments === "string"
+              ? fn.arguments
+              : (fn.arguments && typeof fn.arguments === "object"
+                  ? JSON.stringify(fn.arguments)
+                  : "")
+          }
+        };
+      }).filter(Boolean);
+    }
+  }
+  return [];
 }
 
 function countStringLines(s) {
