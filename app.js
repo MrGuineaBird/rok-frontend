@@ -15430,7 +15430,6 @@ async function send() {
                     const fParsed = extractTokenFromStreamPayload(fData);
                     if (fParsed.daedalus_quota) { applyDaedalusQuota(fParsed.daedalus_quota); }
                     if (fParsed.work) { handleWorkTraceEvent(fParsed.work); }
-                  if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.thinking) { handleThinking(fParsed.thinking); }
                     if (fParsed.tool_calls) { handleToolCalls(fParsed.tool_calls, fParsed.assistant_content); }
@@ -15458,7 +15457,8 @@ async function send() {
                   if (fParsed.agent_loop) { handleAgentLoopEvent(fParsed.agent_loop); }
                 }
               }
-            } catch (followupErr) {
+            }
+          } catch (followupErr) {
             console.log("Tool follow-up streaming error:", followupErr);
             // Continue processing even if streaming fails
             if (!String(partialText || "").trim()) {
@@ -15468,18 +15468,6 @@ async function send() {
                 noteAnswerStarted();
               }
             }
-          }
-          if (!followupRes.ok) {
-            console.log("Tool follow-up request failed with status:", followupRes.status);
-            // Don't break immediately - try to provide a fallback response
-            if (!String(partialText || "").trim()) {
-              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
-              if (fallbackReply) {
-                partialText = fallbackReply;
-                noteAnswerStarted();
-              }
-            }
-            break;
           }
 
           // If more tool_calls were collected during the follow-up, the loop continues
