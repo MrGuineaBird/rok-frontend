@@ -14128,7 +14128,24 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
       if (rawCalls && rawCalls.length) {
         for (const tc of rawCalls) {
           if (!tc || typeof tc !== "object") continue;
-          const fn = tc.function || {};
+          // The backend emits tool calls in TWO shapes that must both parse:
+          //   - Ollama native (flat):  { id, name, arguments }   <- from
+          //     extract_tool_calls_from_message / _flush_openai_tool_accumulator
+          //   - OpenAI wrapped:        { id, function: { name, arguments } } <- upstream passthrough
+          // The previous code only read tc.function.name, so the flat Ollama
+          // shape had fn = {} and name = "" -> `if (!name) continue` silently
+          // dropped EVERY native tool call. With the agentic system prompt
+          // forbidding prose replies, that left fullText empty AND toolCalls
+          // empty -> the user always saw "the model returned empty." Normalize
+          // both shapes into a canonical OpenAI-wrapped object before dedup.
+          let fn;
+          if (tc.function && typeof tc.function === "object") {
+            fn = tc.function;
+          } else if (typeof tc.name === "string") {
+            fn = { name: tc.name, arguments: tc.arguments };
+          } else {
+            fn = {};
+          }
           const name = String(fn.name || "").trim();
           if (!name) continue;
           let argsKey;
@@ -14142,7 +14159,16 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
           const fp = `${name}#${argsKey}`;
           if (toolCallsFingerprints.has(fp)) continue;
           toolCallsFingerprints.add(fp);
-          toolCalls.push(tc);
+          // Push a canonical OpenAI-wrapped tool call so the executor below
+          // (which reads tc.function.name / tc.function.arguments) works
+          // regardless of which shape the backend emitted.
+          toolCalls.push({
+            id: String(tc.id || ""),
+            function: {
+              name,
+              arguments: fn.arguments
+            }
+          });
         }
       }
     };
