@@ -3217,13 +3217,8 @@ function browserPilotTaskWantsFinalSend(task) {
 }
 
 function looksLikeBrowserPilotRequest(text) {
-  const source = String(text || "").trim();
-  if (!source || source.startsWith("/")) return false;
-  return (
-    /\b(?:browser|tab|website|web page|page|youtube|gmail|google docs|google doc|docs\.new|google search|chrome|chromium)\b/i.test(source) ||
-    /\b(?:open|go to|visit|navigate|click|tap|type|fill|press|search|find)\b[\s\S]{0,80}\b(?:site|page|youtube|gmail|google|docs|video|tab)\b/i.test(source) ||
-    /https?:\/\/|^[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?$/i.test(source)
-  );
+  // Disable browser pilot functionality
+  return false;
 }
 
 function buildBrowserPilotReply(data, task) {
@@ -3384,23 +3379,9 @@ async function tryHandleNaturalBrowserPilotAgent(task, attachmentList = []) {
   const normalizedTask = String(task || "").trim();
   if (!normalizedTask || normalizedTask.startsWith("/")) return false;
   if (Array.isArray(attachmentList) && attachmentList.length > 0) return false;
+  // Disable browser pilot for hosted environments
   if (!isLocalBrowserHost()) {
-    if (!looksLikeBrowserPilotRequest(normalizedTask)) return false;
-    input.value = "";
-    autoResizeInput();
-    input.focus();
-    addMessage("user", normalizedTask);
-    history.push({ role: "user", content: normalizedTask });
-    trimHistoryToLimit();
-    syncCurrentSessionFromHistory();
-    const target = openBrowserPilotClientTab(normalizedTask);
-    const reply = buildBrowserPilotHostedReply(target);
-    addMessage("bot", reply, { markdown: true });
-    history.push({ role: "assistant", content: reply });
-    trimHistoryToLimit();
-    syncCurrentSessionFromHistory();
-    scrollToBottom();
-    return true;
+    return false;
   }
   if (browserPilotLaunching || isSending || isIntentClassificationLoading || isWorkspaceSuggestionLoading) return false;
 
@@ -3529,15 +3510,7 @@ async function handleBrowserPilotCommand(task = "", options = {}) {
   }
 
   if (!isLocalBrowserHost()) {
-    const target = openBrowserPilotClientTab(normalizedTask);
-    const reply = buildBrowserPilotHostedReply(target);
-    addMessage("bot", reply, { markdown: true });
-    history.push({ role: "assistant", content: reply });
-    trimHistoryToLimit();
-    syncCurrentSessionFromHistory();
-    browserPilotLaunching = false;
-    refreshSendState();
-    scrollToBottom();
+    // Disable browser pilot for hosted environments
     return;
   }
 
@@ -8808,9 +8781,6 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
   const toolNames = selectedTools
     .map((tool) => String(tool && tool.function && tool.function.name || "").trim().toLowerCase())
     .filter(Boolean);
-  const text = String(context.text || "");
-  const intent = context.intent || null;
-  const codingRequest = requestLooksLikeCodingRequest(text, intent);
   const lines = [
     "When the user asks you to create, read, edit, or list files, you MUST use the file tools (list_files, read_file, write_file, edit_file).",
     "Always use tools for file operations - do not just describe what you would do.",
@@ -8818,22 +8788,11 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
     "Do NOT output tool calls as JSON text in your message content. Use the structured tool_calls format instead.",
     "Example tool call format: tool_calls: [{id: 'call_123', type: 'function', function: {name: 'write_file', arguments: '{\"path\": \"file.txt\", \"content\": \"...\"}'}}]"
   ];
-  if (codingRequest) {
-    lines.push(
-      "This is a coding or build request. Use list_files to discover workspace files, read_file before editing, write_file for new files, and edit_file for surgical changes.",
-      "Do NOT call generate_image, sketch_board, web_search, or web_fetch."
-    );
-  } else if (!toolNames.length) {
-    lines.push(
-      "Answer with text or code directly when no tools are available.",
-      "Do NOT call generate_image, sketch_board, web_search, or web_fetch."
-    );
-  }
   const fileToolNames = ["list_files", "read_file", "write_file", "edit_file"];
   if (fileToolNames.some((name) => toolNames.includes(name))) {
     lines.push(
       "Prefer write_file and edit_file over pasting full file contents in chat.",
-      "Use edit_file only when old_string appears exactly once in the target file."
+      "Use edit_file for surgical changes - the old_string must appear exactly once in the target file. If it appears multiple times, add more context to make it unique."
     );
   }
   if (toolNames.includes("generate_image")) {
@@ -13295,12 +13254,41 @@ function requestLooksLikeSoftwareBuildRequest(text = "") {
   const value = String(text || "").trim().toLowerCase();
   if (!value) return false;
   return (
-    /\b(html|css|javascript|js\b|typescript|python|java|c\+\+|rust|php|ruby|sql|json|yaml)\b/.test(value)
-    || /\b(script|code|app|application|website|webpage|web page|web app|program|api|component|function|class|module|framework|react|vue|angular|node\.?js|express|flask|django)\b/.test(value)
-    || /\b(minecraft|roblox|unity|godot|three\.?js|canvas game|browser game)\b/.test(value)
-    || /\b(one file|single file|html file|index\.html|\.html|\.js|\.css|\.py)\b/.test(value)
-    || /\bmake (me )?(a |an )?.+(in|using|with) (html|css|js|javascript|python|code)\b/.test(value)
-    || /\b(build|create|write|implement|develop).+(game|app|site|website|script|program|page)\b/.test(value)
+    // Programming languages
+    /\b(html|css|javascript|js\b|typescript|ts\b|python|java|c\+\+|rust|php|ruby|sql|json|yaml|xml|go|swift|kotlin|scala|c#|r|matlab)\b/.test(value)
+    // Development concepts
+    || /\b(script|code|app|application|website|webpage|web page|web app|program|api|component|function|class|module|framework|library|package|dependency)\b/.test(value)
+    // Frameworks and technologies
+    || /\b(react|vue|angular|node\.?js|express|flask|django|rails|spring|laravel|next\.?js|nuxt|gatsby|svelte|ember)\b/.test(value)
+    // Game development
+    || /\b(minecraft|roblox|unity|godot|three\.?js|canvas game|browser game|game engine|game dev)\b/.test(value)
+    // File patterns
+    || /\b(one file|single file|html file|index\.html|\.html|\.js|\.css|\.py|\.ts|\.java|\.cpp|\.c|\.rb|\.php|\.go|\.rs)\b/.test(value)
+    // Action patterns
+    || /\bmake (me )?(a |an )?.+(in|using|with) (html|css|js|javascript|python|code|typescript)\b/.test(value)
+    || /\b(build|create|write|implement|develop|code|program).+(game|app|site|website|script|program|page|function|class|module|api|component)\b/.test(value)
+    // Debugging and fixing
+    || /\b(debug|fix|repair|resolve|solve).+(bug|issue|error|problem|fault)\b/.test(value)
+    // File operations
+    || /\b(read|edit|modify|change|update|delete|remove|add|create|write).+(file|files|code|script|program)\b/.test(value)
+    // Project structure
+    || /\b(project|repo|repository|folder|directory|structure|organization).+(file|files|code|source)\b/.test(value)
+    // Developer tools
+    || /\b(git|github|gitlab|version control|commit|push|pull|merge|branch|fork|clone)\b/.test(value)
+    // Development environment
+    || /\b(terminal|console|command line|cli|shell|bash|powershell|cmd)\b/.test(value)
+    // Testing
+    || /\b(test|testing|unit test|integration test|e2e|spec|mock|stub)\b/.test(value)
+    // Deployment and build
+    || /\b(deploy|deployment|build|compile|transpile|bundle|package|publish|release)\b/.test(value)
+    // Data structures and algorithms
+    || /\b(array|object|list|map|set|hash|tree|graph|queue|stack|linked list|algorithm|recursion|iteration)\b/.test(value)
+    // Database
+    || /\b(database|db|sql|nosql|mongodb|postgres|mysql|sqlite|redis|elasticsearch|query|schema|migration)\b/.test(value)
+    // Server and backend
+    || /\b(server|backend|frontend|fullstack|client|api|rest|graphql|grpc|websocket|http|https|tcp|udp)\b/.test(value)
+    // DevOps and infrastructure
+    || /\b(docker|container|kubernetes|k8s|ci\/cd|pipeline|aws|azure|gcp|cloud|serverless|lambda)\b/.test(value)
   );
 }
 
@@ -13521,18 +13509,10 @@ const BUILTIN_TOOLS = [
 ];
 
 function selectBuiltinToolsForRequest(text = "", intent = null) {
+  // Always expose all tools and let the model decide via system prompt
+  // Remove heuristic pre-filtering for more reliable tool selection
   if (!toolsEnabled) return [];
-  if (requestLooksLikeCodingRequest(text, intent)) {
-    return [...FILE_TOOL_DEFINITIONS];
-  }
-  const selected = [...UTILITY_BUILTIN_TOOLS, ...FILE_TOOL_DEFINITIONS];
-  if (requestLooksLikeExplicitImageGeneration(text)) {
-    selected.push(GENERATE_IMAGE_BUILTIN_TOOL);
-  }
-  if (requestLooksLikeDiagramRequest(text)) {
-    selected.push(SKETCH_BOARD_BUILTIN_TOOL);
-  }
-  return selected;
+  return [...UTILITY_BUILTIN_TOOLS, ...FILE_TOOL_DEFINITIONS, SKETCH_BOARD_BUILTIN_TOOL, GENERATE_IMAGE_BUILTIN_TOOL];
 }
 
 function validateBuiltinToolExecution(name, context = {}) {
@@ -13599,82 +13579,6 @@ function normalizeBuiltinToolName(name) {
 function getNormalizedToolCallName(toolCall) {
   const fn = toolCall && (toolCall.function || toolCall);
   return normalizeBuiltinToolName((fn && fn.name) || toolCall.name || "");
-}
-
-const LEAKED_TOOL_CALL_KEY_RE = /^[\{\[]\s*\{?\s*"(tool_calls|tool_call|function_call|function|tool|cmd|name)"\s*:/;
-
-function stripToolDraftFence(text) {
-  let trimmed = String(text || "").trim();
-  const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*(?:```)?$/i);
-  if (fenceMatch) {
-    trimmed = fenceMatch[1].trim();
-  }
-  return trimmed;
-}
-
-function mightBeLeakedToolCallDraft(text) {
-  const trimmed = stripToolDraftFence(text);
-  if (!trimmed) return false;
-  if (trimmed[0] !== "{" && trimmed[0] !== "[") return false;
-  if (LEAKED_TOOL_CALL_KEY_RE.test(trimmed)) return true;
-  // Not enough characters yet to know which key the JSON object starts with
-  return trimmed.length < 40 && /^[\{\[][\s\{"a-z_]*$/i.test(trimmed);
-}
-
-function normalizeLeakedToolCall(call) {
-  if (!call || typeof call !== "object") return null;
-  const fn = call.function && typeof call.function === "object" ? call.function : call;
-  const name = fn.name || call.tool || call.cmd || "";
-  if (!name || typeof name !== "string") return null;
-  let args = fn.arguments;
-  if (args === undefined) args = call.arguments;
-  if (args === undefined) args = call.params;
-  if (typeof args !== "string") {
-    try {
-      args = JSON.stringify(args || {});
-    } catch (_) {
-      args = "{}";
-    }
-  }
-  const normalized = { type: "function", function: { name: String(name), arguments: args } };
-  if (call.id) normalized.id = String(call.id);
-  return normalized;
-}
-
-function extractLeakedToolCalls(text) {
-  const trimmed = stripToolDraftFence(text);
-  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
-  let parsed = null;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch (_) {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-  let rawCalls = null;
-  if (Array.isArray(parsed)) {
-    rawCalls = parsed;
-  } else if (Array.isArray(parsed.tool_calls)) {
-    rawCalls = parsed.tool_calls;
-  } else if (parsed.tool_call && typeof parsed.tool_call === "object") {
-    rawCalls = [parsed.tool_call];
-  } else if (parsed.function_call && typeof parsed.function_call === "object") {
-    rawCalls = [parsed.function_call];
-  } else if (
-    parsed.function || parsed.tool || parsed.cmd ||
-    (typeof parsed.name === "string" && (parsed.arguments !== undefined || parsed.params !== undefined))
-  ) {
-    rawCalls = [parsed];
-  }
-  if (!Array.isArray(rawCalls) || !rawCalls.length) return null;
-  const toolCalls = rawCalls.map(normalizeLeakedToolCall).filter(Boolean);
-  if (!toolCalls.length || toolCalls.length !== rawCalls.length) return null;
-  let assistantContent = "";
-  if (!Array.isArray(parsed)) {
-    if (typeof parsed.content === "string") assistantContent = parsed.content;
-    else if (typeof parsed.assistant_content === "string") assistantContent = parsed.assistant_content;
-  }
-  return { toolCalls, assistantContent };
 }
 
 function summarizeFileToolOutcomes(outcomes = []) {
@@ -13930,10 +13834,63 @@ async function executeBuiltinTool(name, args, context = {}) {
         const editFile = sandbox.files.find((f) => f.path.toLowerCase() === editPath.toLowerCase());
         if (!editFile) return { ok: false, error: `File not found: ${editPath}` };
         const fileContent = String(editFile.content || "");
-        const occurrences = fileContent.split(oldStr).length - 1;
+        
+        // Try exact match first
+        let occurrences = fileContent.split(oldStr).length - 1;
+        let matchedString = oldStr;
+        
+        // Fuzzy matching fallbacks if exact match fails
+        if (occurrences === 0) {
+          // Try with trailing whitespace stripped
+          const strippedTrailing = oldStr.trimEnd();
+          if (strippedTrailing !== oldStr) {
+            occurrences = fileContent.split(strippedTrailing).length - 1;
+            if (occurrences > 0) matchedString = strippedTrailing;
+          }
+        }
+        
+        if (occurrences === 0) {
+          // Try with leading whitespace stripped
+          const strippedLeading = oldStr.trimStart();
+          if (strippedLeading !== oldStr) {
+            occurrences = fileContent.split(strippedLeading).length - 1;
+            if (occurrences > 0) matchedString = strippedLeading;
+          }
+        }
+        
+        if (occurrences === 0) {
+          // Try with both leading and trailing whitespace stripped
+          const strippedBoth = oldStr.trim();
+          if (strippedBoth !== oldStr) {
+            occurrences = fileContent.split(strippedBoth).length - 1;
+            if (occurrences > 0) matchedString = strippedBoth;
+          }
+        }
+        
+        if (occurrences === 0) {
+          // Try with normalized whitespace (collapse multiple spaces/tabs to single space)
+          const normalized = oldStr.trim().replace(/\s+/g, ' ');
+          if (normalized !== oldStr.trim()) {
+            occurrences = fileContent.split(normalized).length - 1;
+            if (occurrences > 0) matchedString = normalized;
+          }
+        }
+        
         if (occurrences === 0) return { ok: false, error: `old_string not found in ${editPath}` };
-        if (occurrences > 1) return { ok: false, error: `old_string appears ${occurrences} times in ${editPath}. Add more context to make it unique.` };
-        editFile.content = fileContent.replace(oldStr, newStr);
+        if (occurrences > 1) {
+          // Provide helpful context for resolving the ambiguity
+          const lines = fileContent.split('\n');
+          const matchingLines = [];
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(matchedString)) {
+              matchingLines.push(`Line ${i + 1}: ${lines[i].trim().slice(0, 100)}`);
+            }
+          }
+          const contextPreview = matchingLines.slice(0, 5).join('\n');
+          const moreText = matchingLines.length > 5 ? `\n... and ${matchingLines.length - 5} more matches` : '';
+          return { ok: false, error: `old_string appears ${occurrences} times in ${editPath}. Add more surrounding context to make it unique.\n\nMatching lines:\n${contextPreview}${moreText}` };
+        }
+        editFile.content = fileContent.replace(matchedString, newStr);
         editFile.updatedAt = Date.now();
         clearSandboxUndoSnapshot(sandbox);
         sandbox.statusText = `File edited in browser storage: ${editPath}`;
@@ -14408,8 +14365,7 @@ async function send() {
   let answerStarted = false;
   let assistantStreamStarted = false;
   let pendingToolCalls = [];
-  let toolDraftBuffer = "";
-  let toolDraftBufferActive = false;
+  let processedToolCallIds = new Set();
   let allowedBuiltinToolNames = new Set();
   let activeBuiltinToolContext = { userText: text, intent: fallbackIntent, allowedToolNames: allowedBuiltinToolNames };
   let webSearchVisualActive = false;
@@ -14837,7 +14793,6 @@ async function send() {
       ? toolCalls.map((toolCall) => getToolCallName(toolCall)).filter(Boolean)
       : [];
     if (!toolNames.length) return false;
-    if (extractLeakedToolCalls(trimmed)) return true;
     const onlyWebTools = toolNames.every((name) => name === "web_search" || name === "web_fetch");
     if (!onlyWebTools) return false;
     return isSlashToolDraft(trimmed) || isJsonToolDraft(trimmed);
@@ -14865,6 +14820,14 @@ async function send() {
       const toolCallId = tc && tc.id
         ? String(tc.id)
         : `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      
+      // Skip if we've already processed this tool call ID
+      if (processedToolCallIds.has(toolCallId)) {
+        console.log("Skipping duplicate tool call:", toolCallId);
+        continue;
+      }
+      processedToolCallIds.add(toolCallId);
+      
       const toolName = getToolCallName(tc);
       console.log("Processing tool call:", toolName, "allowed:", allowedBuiltinToolNames.size, "has:", allowedBuiltinToolNames.has(toolName));
       if (allowedBuiltinToolNames.size && !allowedBuiltinToolNames.has(toolName)) {
@@ -14984,28 +14947,6 @@ async function send() {
   const handleAnswerToken = (token) => {
     const piece = String(token || "");
     if (!piece) return;
-    if (toolDraftBufferActive || (!partialText.trim() && mightBeLeakedToolCallDraft(toolDraftBuffer + piece))) {
-      toolDraftBufferActive = true;
-      toolDraftBuffer += piece;
-      const extracted = extractLeakedToolCalls(toolDraftBuffer);
-      if (extracted) {
-        toolDraftBuffer = "";
-        toolDraftBufferActive = false;
-        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
-        return;
-      }
-      if (!mightBeLeakedToolCallDraft(toolDraftBuffer)) {
-        const buffered = toolDraftBuffer;
-        toolDraftBuffer = "";
-        toolDraftBufferActive = false;
-        renderAnswerPiece(buffered);
-      }
-      return;
-    }
-    renderAnswerPiece(piece);
-  };
-  const renderAnswerPiece = (piece) => {
-    if (!piece) return;
     noteAnswerStarted();
     markAssistantStreamStarted();
     partialText += piece;
@@ -15026,13 +14967,33 @@ async function send() {
     let textChunk = thinkTagCarry + String(chunk || "");
     thinkTagCarry = "";
 
-    // Route JSON tool calls that leaked into text content to the tool executor
-    const chunkTrimmed = textChunk.trim();
-    if (chunkTrimmed.startsWith("{") && chunkTrimmed.endsWith("}")) {
-      const extracted = extractLeakedToolCalls(chunkTrimmed);
-      if (extracted) {
-        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
-        return;
+    // Hide JSON tool calls that leaked into text content
+    // Check if entire chunk is a tool call JSON
+    if (textChunk.trim().startsWith("{") && textChunk.trim().endsWith("}")) {
+      try {
+        const parsed = JSON.parse(textChunk.trim());
+        if (parsed && typeof parsed === "object" && (parsed.cmd || parsed.tool || parsed.name)) {
+          // This looks like a leaked tool call, don't display it
+          return;
+        }
+      } catch (e) {
+        // Not valid JSON, display normally
+      }
+    }
+    // Also check for JSON tool calls embedded within text
+    const jsonPattern = /\{[^{}]*"cmd"[^{}]*\}|\{[^{}]*"tool"[^{}]*\}|\{[^{}]*"name"[^{}]*\}/gi;
+    const matches = textChunk.match(jsonPattern);
+    if (matches) {
+      for (const match of matches) {
+        try {
+          const parsed = JSON.parse(match);
+          if (parsed && typeof parsed === "object" && (parsed.cmd || parsed.tool || parsed.name)) {
+            // Remove this tool call JSON from the display
+            textChunk = textChunk.replace(match, "");
+          }
+        } catch (e) {
+          // Not valid JSON, keep it
+        }
       }
     }
     while (textChunk) {
@@ -15072,27 +15033,13 @@ async function send() {
     }
   };
   const flushTaggedTokenCarry = () => {
-    if (thinkTagCarry) {
-      if (insideThinkTag) {
-        handleThinking(thinkTagCarry);
-      } else {
-        handleAnswerToken(thinkTagCarry);
-      }
-      thinkTagCarry = "";
-    }
-    if (toolDraftBuffer) {
-      const buffered = toolDraftBuffer;
-      toolDraftBuffer = "";
-      toolDraftBufferActive = false;
-      const extracted = extractLeakedToolCalls(buffered);
-      if (extracted) {
-        handleToolCalls(extracted.toolCalls, extracted.assistantContent);
-      } else {
-        renderAnswerPiece(buffered);
-      }
+    if (!thinkTagCarry) return;
+    if (insideThinkTag) {
+      handleThinking(thinkTagCarry);
     } else {
-      toolDraftBufferActive = false;
+      handleAnswerToken(thinkTagCarry);
     }
+    thinkTagCarry = "";
   };
   const initialFastStatus = getFastStartStatusForIntent(fallbackIntent, {
     imageAttachmentCount: initialImageAttachmentCount,
@@ -15323,13 +15270,7 @@ async function send() {
         handleThinking(separatedReply.thinking);
       }
       reply = separatedReply.answer || (separatedReply.thinking ? "" : reply);
-      const leakedFromReply = extractLeakedToolCalls(reply);
-      if (leakedFromReply && toolsEnabled && allowedBuiltinToolNames.size) {
-        handleToolCalls(leakedFromReply.toolCalls, leakedFromReply.assistantContent);
-        partialText = "";
-      } else {
-        partialText = reply || "(No response)";
-      }
+      partialText = reply || "(No response)";
       if (partialText) {
         noteAnswerStarted();
       }
@@ -15354,6 +15295,7 @@ async function send() {
             return { ...tc, id: toolCallId };
           });
           pendingToolCalls = [];
+          processedToolCallIds.clear();
 
           // Build assistant message with tool_calls for history
           const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
@@ -15477,6 +15419,7 @@ async function send() {
                     const fParsed = extractTokenFromStreamPayload(fData);
                     if (fParsed.daedalus_quota) { applyDaedalusQuota(fParsed.daedalus_quota); }
                     if (fParsed.work) { handleWorkTraceEvent(fParsed.work); }
+                  if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.web_tool) { handleWebToolEvent(fParsed.web_tool); }
                     if (fParsed.thinking) { handleThinking(fParsed.thinking); }
                     if (fParsed.tool_calls) { handleToolCalls(fParsed.tool_calls, fParsed.assistant_content); }
@@ -15780,6 +15723,7 @@ async function send() {
           return { ...tc, id: toolCallId };
         });
         pendingToolCalls = [];
+        processedToolCallIds.clear();
 
         const assistantContent = callsToExecute[0]._assistantContent || partialText || "";
         const toolCallsForHistory = callsToExecute.map(tc => ({
