@@ -8733,6 +8733,8 @@ function getIntentRoutingSystemPrompt(intent) {
       "Prefer patches, commands, tests, exact file/function references, and concise reasoning over lecture-mode explanation.",
       "When creating or modifying project files, use list_files, read_file, write_file, and edit_file instead of dumping large files inline.",
       "Use write_file for new files and edit_file for targeted changes to existing files. Read files before editing them.",
+      "For requests to create a coding file, app, game, script, HTML/CSS/JS file, or single-file project, you MUST call write_file with the full file content. Do not paste the file contents into chat.",
+      "For requests to change an existing coding file or previously created file, you MUST call read_file if needed and then edit_file or write_file. Do not stop after list_files/read_file.",
       "Do not generate images or diagrams unless explicitly requested."
     ],
     cybersecurity: [
@@ -8781,9 +8783,15 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
   const toolNames = selectedTools
     .map((tool) => String(tool && tool.function && tool.function.name || "").trim().toLowerCase())
     .filter(Boolean);
+  const userText = String(context.text || "");
+  const followupLooksLikeMutation = hasExistingSandboxFiles()
+    && /\b(make|change|update|edit|modify|fix|add|remove|replace|set|turn)\b/i.test(userText);
   const lines = [
     "When the user asks you to create, read, edit, or list files, you MUST use the file tools (list_files, read_file, write_file, edit_file).",
     "Always use tools for file operations - do not just describe what you would do.",
+    "For coding artifacts, games, apps, websites, scripts, HTML, CSS, JS, Python, or config files, creating means call write_file; modifying means call edit_file or write_file.",
+    "Never answer a coding-file creation request with only a code block or plan. The file must be created through write_file.",
+    "Never answer a file modification request with only list_files or read_file. Listing/reading is discovery; after discovery, continue by calling edit_file or write_file.",
     "IMPORTANT: When calling tools, use the standard tool_calls format with 'tool_calls' array containing objects with 'id', 'type: function', and 'function' fields.",
     "Do NOT output tool calls as JSON text in your message content. Use the structured tool_calls format instead.",
     "Example tool call format: tool_calls: [{id: 'call_123', type: 'function', function: {name: 'write_file', arguments: '{\"path\": \"file.txt\", \"content\": \"...\"}'}}]"
@@ -8792,8 +8800,12 @@ function applyToolChainingGuidanceToRequestBody(requestBody, context = {}) {
   if (fileToolNames.some((name) => toolNames.includes(name))) {
     lines.push(
       "Prefer write_file and edit_file over pasting full file contents in chat.",
-      "Use edit_file for surgical changes - the old_string must appear exactly once in the target file. If it appears multiple times, add more context to make it unique."
+      "Use edit_file for surgical changes - the old_string must appear exactly once in the target file. If it appears multiple times, add more context to make it unique.",
+      "If the user asks to update the only matching workspace file, you may list_files to identify it, but your next tool call must be read_file/edit_file/write_file, not a final answer."
     );
+    if (followupLooksLikeMutation) {
+      lines.push("There are already files in the browser workspace. If the user says to change 'it' or a game/app detail, treat that as a request to edit the relevant existing file with file tools.");
+    }
   }
   if (toolNames.includes("generate_image")) {
     lines.push(
@@ -13298,6 +13310,24 @@ function requestLooksLikeCodingRequest(text = "", intent = null) {
   return requestLooksLikeSoftwareBuildRequest(text);
 }
 
+function requestLooksLikeCodingFileMutation(text = "", intent = null) {
+  const value = String(text || "").trim().toLowerCase();
+  if (!value) return false;
+  const asksToChange = /\b(make|create|write|build|implement|develop|code|edit|modify|change|update|fix|repair|add|remove|replace|set|turn)\b/.test(value);
+  const mentionsFileOrCode = requestLooksLikeCodingRequest(value, intent)
+    || /\b(file|files|code|script|program|app|game|website|webpage|html|css|javascript|js|python)\b/.test(value);
+  return asksToChange && (mentionsFileOrCode || hasExistingSandboxFiles());
+}
+
+function hasExistingSandboxFiles() {
+  try {
+    const sandbox = getCurrentSandboxState();
+    return Boolean(sandbox && Array.isArray(sandbox.files) && sandbox.files.length);
+  } catch (_) {
+    return false;
+  }
+}
+
 function requestLooksLikeExplicitImageGeneration(text = "") {
   const value = String(text || "").trim().toLowerCase();
   if (!value || requestLooksLikeSoftwareBuildRequest(value)) return false;
@@ -13553,7 +13583,7 @@ function applyBuiltinToolsToRequestBody(requestBody, text = "", intent = null) {
 }
 
 const BUILTIN_TOOL_MAX_LOOP = 5;
-const BUILTIN_TOOL_FOLLOWUP_MESSAGE = "The tool results are above. Use them to complete the user's request. If you need to make more changes, call additional tools. Otherwise, provide a clear response to the user.";
+const BUILTIN_TOOL_FOLLOWUP_MESSAGE = "The tool results are above. Use them to complete the user's request. If the user asked to create or modify a coding file, do not stop after list_files or read_file - call write_file or edit_file to perform the change. Otherwise, provide a clear response to the user.";
 
 const BUILTIN_FILE_TOOL_NAMES = new Set(["list_files", "read_file", "write_file", "edit_file"]);
 
@@ -13600,6 +13630,26 @@ function summarizeFileToolOutcomes(outcomes = []) {
     }
   }
   return lines.join("\n");
+}
+
+function hasSuccessfulFileMutationOutcome(outcomes = []) {
+  return outcomes.some((outcome) => {
+    if (!outcome || !outcome.ok) return false;
+    const name = normalizeBuiltinToolName(outcome.name);
+    return name === "write_file" || name === "edit_file";
+  });
+}
+
+function summarizeFileToolOutcomesForRequest(outcomes = [], text = "", intent = null) {
+  const summary = summarizeFileToolOutcomes(outcomes);
+  if (
+    summary
+    && requestLooksLikeCodingFileMutation(text, intent)
+    && !hasSuccessfulFileMutationOutcome(outcomes)
+  ) {
+    return "";
+  }
+  return summary;
 }
 
 function startGenerateImageTool(args = {}) {
@@ -15387,17 +15437,17 @@ async function send() {
             });
 
             if (!followupRes.ok) {
-            console.log("Tool follow-up request failed with status:", followupRes.status);
-            // Don't break immediately - try to provide a fallback response
-            if (!String(partialText || "").trim()) {
-              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
-              if (fallbackReply) {
-                partialText = fallbackReply;
-                noteAnswerStarted();
+              console.log("Tool follow-up request failed with status:", followupRes.status);
+              // Don't break immediately - try to provide a fallback response
+              if (!String(partialText || "").trim()) {
+                const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
+                if (fallbackReply) {
+                  partialText = fallbackReply;
+                  noteAnswerStarted();
+                }
               }
+              break;
             }
-            break;
-          }
 
             const followupContentType = (followupRes.headers.get("content-type") || "").toLowerCase();
             applyThinkingQuotaFromHeaders(followupRes);
@@ -15462,7 +15512,7 @@ async function send() {
             console.log("Tool follow-up streaming error:", followupErr);
             // Continue processing even if streaming fails
             if (!String(partialText || "").trim()) {
-              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
               if (fallbackReply) {
                 partialText = fallbackReply;
                 noteAnswerStarted();
@@ -15474,7 +15524,7 @@ async function send() {
         }
 
         if (!String(partialText || "").trim()) {
-          const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+          const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
           if (fallbackReply) {
             partialText = fallbackReply;
             noteAnswerStarted();
@@ -15827,7 +15877,7 @@ async function send() {
             console.log("Tool follow-up request failed with status:", followupRes.status);
             // Don't break immediately - try to provide a fallback response
             if (!String(partialText || "").trim()) {
-              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
               if (fallbackReply) {
                 partialText = fallbackReply;
                 noteAnswerStarted();
@@ -15860,7 +15910,6 @@ async function send() {
                 const fp = extractTokenFromStreamPayload(fd2);
                 if (fp.daedalus_quota) applyDaedalusQuota(fp.daedalus_quota);
                 if (fp.work) handleWorkTraceEvent(fp.work);
-              if (fp.web_tool) handleWebToolEvent(fp.web_tool);
                 if (fp.web_tool) handleWebToolEvent(fp.web_tool);
                 if (fp.thinking) handleThinking(fp.thinking);
                 if (fp.tool_calls) handleToolCalls(fp.tool_calls, fp.assistant_content);
@@ -15890,7 +15939,7 @@ async function send() {
             console.log("Tool follow-up error:", fErr);
             // Don't break immediately - try to provide a fallback response
             if (!String(partialText || "").trim()) {
-              const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+              const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
               if (fallbackReply) {
                 partialText = fallbackReply;
                 noteAnswerStarted();
@@ -15902,7 +15951,7 @@ async function send() {
       }
 
       if (!String(partialText || "").trim()) {
-        const fallbackReply = summarizeFileToolOutcomes(fileToolOutcomes);
+        const fallbackReply = summarizeFileToolOutcomesForRequest(fileToolOutcomes, text, intent);
         if (fallbackReply) {
           partialText = fallbackReply;
           noteAnswerStarted();
