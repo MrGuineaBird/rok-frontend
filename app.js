@@ -13138,11 +13138,17 @@ function createToolCallsPanel(initialSummary = "") {
   let summaryText = initialSummary || "";
 
   function refreshCount() {
-    const doneCount = steps.filter((s) => s.status === "done" || s.status === "error").length;
-    count.textContent =
-      steps.length === 0
-        ? "0 steps"
-        : `${doneCount}/${steps.length} done`;
+    const doneCount = steps.filter((s) => s.status === "done").length;
+    const errorCount = steps.filter((s) => s.status === "error").length;
+    const skippedCount = steps.filter((s) => s.status === "skipped").length;
+    if (steps.length === 0) {
+      count.textContent = "0 steps";
+    } else if (errorCount > 0 || skippedCount > 0) {
+      const tail = `${errorCount + skippedCount} failed`;
+      count.textContent = `${doneCount}/${steps.length} done (${tail})`;
+    } else {
+      count.textContent = `${doneCount}/${steps.length} done`;
+    }
   }
 
   function setHeader(text) {
@@ -13460,6 +13466,7 @@ async function runAgenticTask({ userText } = {}) {
   const results = [];
   let summaryText = "";
   let lastWriteInfo = null;
+  let writeStepFailed = false;
 
   try {
     for (let i = 0; i < plan.length; i++) {
@@ -13479,6 +13486,9 @@ async function runAgenticTask({ userText } = {}) {
               status: "error",
               meta: res.error ? res.error.slice(0, 40) : "error"
             });
+            if (/write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())) {
+              writeStepFailed = true;
+            }
           } else {
             controller.updateStep(id, { status: "done" });
             if (
@@ -13507,9 +13517,17 @@ async function runAgenticTask({ userText } = {}) {
         } catch (e) {
           results.push({ ok: false, error: String((e && e.message) || e) });
           controller.updateStep(id, { status: "error", meta: "threw" });
+          if (/write[_ ]file|edit[_ ]file/.test(String(step.label || "").toLowerCase())) {
+            writeStepFailed = true;
+          }
         }
       } else {
-        controller.updateStep(id, { status: "done" });
+        // Post-write "Ran X" step: only mark done if the pre-step succeeded,
+        // otherwise mark as skipped so the panel doesn't falsely show success
+        // alongside an errored pre-step.
+        controller.updateStep(id, {
+          status: writeStepFailed ? "skipped" : "done"
+        });
       }
     }
 
@@ -13540,16 +13558,42 @@ async function runAgenticTask({ userText } = {}) {
         countStringLines(contentForCount);
       const safePath = String(writePath).trim();
       const lineLabel = inferredLines > 0 ? ` (${inferredLines} lines)` : "";
-      summaryText = `Created \`${safePath}\` in browser storage${lineLabel}.`;
+      // Only claim "Created ..." when the write actually succeeded —
+      // lastWriteInfo is only populated in the success branch, so its
+      // absence means the write_file / edit_file call failed (or the
+      // backend returned ok:false). Surface that honestly instead.
+      const writeSucceeded = Boolean(lastWriteInfo);
+      summaryText = writeSucceeded
+        ? `Created \`${safePath}\` in browser storage${lineLabel}.`
+        : `Couldn't create \`${safePath}\` \u2014 ${(writeResult && writeResult.error) || "file tool call failed"}.`;
     } else {
-      const finalReply =
-        (results[results.length - 1] &&
-          results[results.length - 1].result &&
-          (results[results.length - 1].result.reply ||
-            results[results.length - 1].result.message ||
-            results[results.length - 1].result.echo)) ||
-        "Task finished.";
-      summaryText = String(finalReply);
+      // No write/edit step was attempted. If other steps errored, surface
+      // that honestly instead of claiming "Task finished."
+      const errorCount = (controller && controller.steps
+        ? controller.steps.filter((s) => s.node && s.node.dataset && s.node.dataset.status === "error").length
+        : 0);
+      if (errorCount > 0) {
+        const firstErr = controller.steps.find(
+          (s) => s.node && s.node.dataset && s.node.dataset.status === "error"
+        );
+        const errMeta = firstErr && firstErr.meta ? String(firstErr.meta).trim() : "";
+        summaryText = errMeta
+          ? (errorCount === 1
+              ? `1 tool error — ${errMeta}`
+              : `${errorCount} tool errors — ${errMeta}`)
+          : (errorCount === 1
+              ? "1 tool failed."
+              : `${errorCount} tools failed.`);
+      } else {
+        const finalReply =
+          (results[results.length - 1] &&
+            results[results.length - 1].result &&
+            (results[results.length - 1].result.reply ||
+              results[results.length - 1].result.message ||
+              results[results.length - 1].result.echo)) ||
+          "Task finished.";
+        summaryText = String(finalReply);
+      }
     }
     controller.setSummary(summaryText);
 
