@@ -13323,15 +13323,20 @@ function renderToolCallsSummary(raw) {
 // Triggered automatically by `looksLikeCodingRequest(text)` in the main
 // send-message flow, and also by the `/agentic <prompt>` slash command.
 // ---------------------------------------------------------------------------
-const AGENTIC_CODING_MODEL_ID =
-  (typeof HYPERION_MODEL_ID === "string" && HYPERION_MODEL_ID) || "gpt-oss:120b-cloud";
+// Default model for agentic runs when nothing else is unlocked. Only
+// Hermes actually routes through Ollama's /api/chat and honors native
+// `tools: [...]` end-to-end; Hyperion/Daedalus hit NVIDIA's API and the
+// backend's SSE wrapper drops their tool_calls.
+const AGENTIC_CODING_MODEL_ID = HERMES_MODEL_ID;
 // Ordered preference list — pickAgenticCodingModelId walks this and skips any
 // model that is currently quota-locked (Titan / Hyperion daily caps, Daedalus
-// token rolling window).
+// token rolling window). Hermes MUST lead this list because it's the only
+// Ollama-cloud-backed path with native tool-calling support; Hyperion and
+// Daedalus only work for plain chat / non-agentic asks.
 const AGENTIC_CODING_MODEL_FALLBACKS = [
+  HERMES_MODEL_ID,
   HYPERION_MODEL_ID,
-  DAEDALUS_MODEL_ID,
-  HERMES_MODEL_ID
+  DAEDALUS_MODEL_ID
 ].filter(Boolean);
 
 // Tracks the most recent successful agentic run so a short follow-up
@@ -13380,22 +13385,27 @@ function escapeAgenticPromptPath(rawPath) {
 }
 
 const AGENTIC_CODING_SYSTEM_PROMPT = [
-  "You are the ROK agentic coding helper. You MUST use the provided native tool-calling API to create or modify files - never emit raw XML tags, markdown fences, or code blocks in your message content.",
+  "You are the ROK agentic coding helper. You MUST use the provided native tool-calling API to create or modify files - never just emit raw XML, markdown fences, or code blocks as your only reply.",
+  "",
+  "NON-NEGOTIABLE: at the end of your turn there must be ONE of the following outcomes:",
+  "  (a) one or more native tool calls (`write_file` / `edit_file` / `read_file` / `list_files`) with all required parameters filled in, OR",
+  "  (b) a single `<rok_file path=\"NAME.EXT\">...complete content...</rok_file>` block in your reply when structured tool calls are unavailable.",
+  "Do NOT reply with empty content or only an apologetic explanation. The system cannot execute anything you did not emit.",
   "",
   "Workflow:",
-  "1. Read the user's request and identify which file(s) need to be created or modified.",
-  "2. If you need to inspect an existing file first (e.g. for an EDIT request), call read_file with its path; then call write_file or edit_file with the FULL updated content.",
-  "3. For a NEW file from scratch, call write_file once with `path` and the complete `content`. Do NOT abbreviate content with placeholders like '...' or 'rest of code'.",
-  "4. For an EDIT to an existing file, prefer edit_file (surgical old_string/new_string change). If the edit is large, use write_file with the COMPLETE updated content.",
-  "5. After all tool calls finish, you may add a 1-3 sentence plain-text reply summarizing what was built or changed. Do not emit code as text.",
+  "1. Read the user's request and identify the file(s) to create or modify. If the user says only a short noun like 'make a flappy bird' or 'build a counter', you MUST infer a sensible default filename (`flappy_bird.html`, `counter.html`, etc.) and write a complete single-file implementation.",
+  "2. For a NEW file from scratch, call (or emit) write_file once with `path` and the COMPLETE `content`. Do NOT abbreviate with placeholders like '...' or 'rest of code'. The file must be runnable end-to-end.",
+  "3. For an EDIT to an existing file, prefer the native `edit_file` tool with a surgical old_string -> new_string change. If the edit is large, use `write_file` with the FULL updated content.",
+  "4. If you must inspect an existing file first, call read_file with its path BEFORE writing.",
+  "5. After all tool calls finish you may add a 1-3 sentence plain-text reply summarizing what was built or changed. Do not emit code as text.",
   "",
   "Tool selection cheat-sheet:",
-  "- list_files -> see what files exist in the workspace",
+  "- list_files -> workspace inventory",
   "- read_file -> fetch an existing file's content",
   "- write_file -> create or fully overwrite a file (path + full content)",
   "- edit_file -> small surgical change (path + old_string + new_string)",
   "",
-  "Filenames: pick sensible default names matching the user's intent (e.g. flappy.html, index.html, app.js, server.py). Always include an extension. The `path` parameter is REQUIRED for all file tools."
+  "Filename convention: pick names matching the user's intent (e.g. flappy_bird.html, index.html, app.js, server.py). Always include an extension. The `path` parameter is REQUIRED."
 ].join("\n");
 
 // Native Ollama tool definitions for the file workspace. Schema conforms to
@@ -13558,23 +13568,32 @@ function isAgenticModelLocked(modelId) {
 }
 
 function pickAgenticCodingModelId() {
+  // Agentic runs ALWAYS go through Hermes 1.4 (gpt-oss:120b-cloud) — it is the
+  // only model that routes through Ollama's /api/chat with end-to-end native
+  // tool-calling support. Hyperion (glm-5.2) and Daedalus (glm-4.7) hit
+  // NVIDIA's API (https://integrate.api.nvidia.com/v1) and the backend's
+  // NvidiaResponse SSE wrapper drops their delta.tool_calls before they reach
+  // the browser, so even if the upstream NVIDIA model emits tool_calls the
+  // front-end would never see them — that's precisely why /agentic was
+  // returning "No tool calls in ROK's reply" for users on Hyperion/Daedalus.
+  // We ignore the session-model preference here on purpose so that picking
+  // the wrong model for normal chat doesn't break agentic runs.
+  if (!isAgenticModelLocked(HERMES_MODEL_ID)) return HERMES_MODEL_ID;
+
+  // Hermes is currently locked (daily cap reached, etc). Fall back through
+  // the rest of the preference list, then to the session model as a last
+  // resort. NOTE: any non-Hermes path here is doomed to NOT carry native
+  // tool_calls — the surface-level error message in runAgenticCodeTask will
+  // tell the user to wait for Hermes instead of pretending the run worked.
   const sessionModel = (typeof getCurrentSessionModel === "function" && getCurrentSessionModel()) || "";
   const order = (Array.isArray(AGENTIC_CODING_MODEL_FALLBACKS) && AGENTIC_CODING_MODEL_FALLBACKS.length)
-    ? AGENTIC_CODING_MODEL_FALLBACKS
-    : [AGENTIC_CODING_MODEL_ID];
-  // Build the candidate list and STRIP locked models — best-effort skip any
-  // model whose quota is currently exhausted so we don't 429 mid-task.
-  const candidates = [];
-  if (sessionModel && !candidates.includes(sessionModel)) candidates.push(sessionModel);
+    ? AGENTIC_CODING_MODEL_FALLBACKS.slice(1)
+    : [];
   for (const id of order) {
-    if (!candidates.includes(id)) candidates.push(id);
+    if (!isAgenticModelLocked(id)) return id;
   }
-  const unlocked = candidates.filter((id) => !isAgenticModelLocked(id));
-  if (unlocked.length === 0) return AGENTIC_CODING_MODEL_ID;
-  // Prefer the user's current session model if it survived the locked-filter,
-  // otherwise the first unlocked candidate from the preference list.
-  if (sessionModel && unlocked.includes(sessionModel)) return sessionModel;
-  return unlocked[0];
+  if (sessionModel && !isAgenticModelLocked(sessionModel)) return sessionModel;
+  return AGENTIC_CODING_MODEL_ID;
 }
 
 // One-UI guard: while an agentic tool-caller run is in progress, the regular
@@ -13994,9 +14013,23 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
     summaryText = `Couldn't write files - ${failed[0].error}`;
   } else if (written.length === 0 && toolCalls.length === 0) {
     const prose = fullText.replace(/\s+/g, " ").trim().slice(0, 280);
-    summaryText = prose
-      ? `No tool calls in ROK's reply: "${prose}${fullText.length > 280 ? "\u2026" : ""}"`
-      : "No tool calls in ROK's reply.";
+    if (prose) {
+      summaryText = `No tool calls in ROK's reply: "${prose}${fullText.length > 280 ? "\u2026" : ""}"`;
+    } else {
+      // Empty reply from the model. Tell the user exactly what to try next
+      // instead of a silent failure. Note: ONLY Hermes routes through Ollama's
+      // /api/chat end-to-end with native tool-calling support — Hyperion and
+      // Daedalus hit NVIDIA's API and the backend drops their tool_calls
+      // before reaching the browser. So we point at Hermes, not Hyperion.
+      const shortPromptHint = text.length < 25
+        ? ` Your prompt is short (${text.length} chars) - try a longer directive one, e.g. "make a flappy bird game in a single HTML file called flappy_bird.html".`
+        : "";
+      const modelHint = ` Make sure Hermes (gpt-oss-120b-cloud, ROK's Ollama-cloud model) is selected in the model picker — only Hermes has end-to-end native tool calling.`;
+      summaryText =
+        `No tool calls in ROK's reply — the model returned empty.` +
+        shortPromptHint +
+        modelHint;
+    }
   } else {
     summaryText =
       `Created ${written.map((w) => "`" + w.path + "`").join(", ")} in browser storage` +
