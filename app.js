@@ -13624,6 +13624,461 @@ async function runAgenticTask({ userText } = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// runAgenticCodeTask — real LLM-driven agentic coding.
+//
+// Replaces the previous stub behaviour (which echoed the user prompt into a
+// placeholder HTML shell). Now: send the request to /api/chat with a
+// coding-focused system prompt, stream the model's reply, then parse any
+// <rok_file path="...">...</rok_file> blocks (or fenced code blocks) out of
+// the response and persist each file via the existing file-tool pipeline,
+// which already falls back to browser-localStorage on Render (no
+// persistent backend storage).
+//
+// Triggered automatically by `looksLikeCodingRequest(text)` in the main
+// send-message flow, and also by the `/agentic <prompt>` slash command.
+// ---------------------------------------------------------------------------
+const AGENTIC_CODING_MODEL_ID =
+  (typeof HYPERION_MODEL_ID === "string" && HYPERION_MODEL_ID) || "gpt-oss:120b-cloud";
+// Ordered preference list — pickAgenticCodingModelId walks this and skips any
+// model that is currently quota-locked (Titan / Hyperion daily caps, Daedalus
+// token rolling window).
+const AGENTIC_CODING_MODEL_FALLBACKS = [
+  HYPERION_MODEL_ID,
+  DAEDALUS_MODEL_ID,
+  HERMES_MODEL_ID
+].filter(Boolean);
+
+const AGENTIC_CODING_SYSTEM_PROMPT = [
+  "You are the ROK agentic coding helper. When the user asks you to create or modify code, follow these rules strictly:",
+  "",
+  "1. Briefly state (1-2 sentences) what you are about to build and which file(s) you will write.",
+  "2. Output each code file in EXACTLY this fenced tag format so the tool caller can persist it:",
+  "",
+  "<rok_file path=\"filename.ext\">",
+  "<full file content, complete and runnable, no placeholders, no truncation>",
+  "</rok_file>",
+  "",
+  "Repeat one <rok_file>...</rok_file> block per file. Multiple files are fine.",
+  "3. The file inside <rok_file> must be complete, copy-pasteable, and ready to run. Never abbreviate with '...' or 'rest of code'.",
+  "4. Pick sensible filenames that match the user's intent (e.g. index.html for HTML demos, app.js for JS, server.py for Python).",
+  "5. If an image, asset, or external library is needed, mention it in one short sentence after the file blocks - do NOT emit unrelated prose before the first rok_file tag.",
+  "6. After all files, you may add a short (1-3 sentence) summary of what was built and how to run it.",
+  "",
+  "If the user prompt is NOT a coding task, reply normally in plain text - do NOT wrap your reply in <rok_file> tags."
+].join("\n");
+
+const AGENTIC_ROK_FILE_RE = /<rok_file\b([^>]*)>([\s\S]*?)<\/rok_file>/gi;
+const AGENTIC_FENCE_RE = /```(?:html|htm|js|jsx|ts|tsx|css|json|py|python|md|csv|svg|sh|bash|java|c|cpp|cs|go|rs|rb|php|swift|kt|dart|lua|toml|yml|yaml|xml|sql|txt|plain)(?:\s+([\w./-]+\.[A-Za-z0-9]+))?\n([\s\S]*?)```/g;
+
+function parseAgenticCodeBlocks(text) {
+  const cleaned = String(text || "");
+  const files = [];
+  const seenPaths = new Set();
+
+  // 1) Prefer the explicit <rok_file path="..."> tag - it's deterministic
+  //    and survives even if the model also wraps content in fences.
+  AGENTIC_ROK_FILE_RE.lastIndex = 0;
+  let match;
+  while ((match = AGENTIC_ROK_FILE_RE.exec(cleaned)) !== null) {
+    const attrs = String(match[1] || "");
+    const content = String(match[2] || "").trim();
+    if (!content) continue;
+    const pathMatch = attrs.match(/path\s*=\s*["']([^"']+)["']/);
+    const rawPath = pathMatch ? pathMatch[1] : "";
+    const path = normalizeAgenticFilePath(rawPath, cleaned) || guessAgenticFilename(cleaned);
+    if (!path) continue;
+    if (seenPaths.has(path)) continue;
+    seenPaths.add(path);
+    files.push({ path, content, source: "rok_file" });
+  }
+  if (files.length) return files;
+
+  // 2) Fall back to fenced ```lang blocks. If there's exactly one written
+  //    file worth of code, treat the strongest fence as the file.
+  AGENTIC_FENCE_RE.lastIndex = 0;
+  while ((match = AGENTIC_FENCE_RE.exec(cleaned)) !== null) {
+    const lang = String(match[1] || "").toLowerCase();
+    const explicitPath = String(match[2] || "").trim();
+    const content = String(match[3] || "").trim();
+    if (!content) continue;
+    // Skip tiny fences (likely illustrative snippets, not full files).
+    if (content.length < 80 && !explicitPath) continue;
+    const path = explicitPath || normalizeAgenticFilePath("", cleaned, lang) || guessAgenticFilename(cleaned);
+    if (!path || seenPaths.has(path)) continue;
+    seenPaths.add(path);
+    files.push({ path, content, source: "fence" });
+  }
+  return files;
+}
+
+function normalizeAgenticFilePath(rawPath, promptText, langHint) {
+  let candidate = String(rawPath || "").trim();
+  if (!candidate && langHint) {
+    const ext = langHint === "python" ? "py" : (langHint === "plain" ? "txt" : langHint);
+    return ""; // caller will derive
+  }
+  candidate = candidate.replace(/^["']+|["']+$/g, "").replace(/^[.\/]+/, "");
+  if (!candidate) return "";
+  // Disallow absolute paths and parent traversal.
+  if (/^[A-Za-z]:[\\/]/.test(candidate) || candidate.startsWith("/") || /(^|\/)\.\.(\/|$)/.test(candidate)) {
+    return "";
+  }
+  // Must contain an extension.
+  if (!/\.[A-Za-z0-9]{1,6}$/.test(candidate)) {
+    const ext = (langHint && langHint !== "plain") ? langHint : "txt";
+    candidate = `${candidate}.${ext === "python" ? "py" : ext}`;
+  }
+  if (candidate.length > 240) return "";
+  return candidate;
+}
+
+function looksLikeCodingRequest(text) {
+  const original = String(text || "");
+  const t = original.toLowerCase().trim();
+  if (!t || t.length < 6) return false;
+
+  // Any explicit filename / extension reference counts as coding.
+  if (
+    /\b[a-z0-9_][\w-]*\.(html|htm|js|ts|jsx|tsx|mjs|cjs|css|scss|less|json|py|rb|go|rs|java|kt|swift|dart|lua|php|c|cpp|cxx|h|hpp|sh|bash|zsh|sql|yaml|yml|toml|xml|svg|md|markdown|txt|csv)\b/i.test(
+      original
+    )
+  ) {
+    return true;
+  }
+  // "in one html file" / "in a single file" / "one html file"
+  if (/\b(in|as)\b[^.!?\n]{0,40}\b(one|single|a)\b[^.!?\n]{0,12}\b(html|js|ts|python|py|file|page|game|app)\b/i.test(t)) {
+    return true;
+  }
+  // Strong code-trigger verbs + a coding-shaped target noun.
+  const trigger =
+    /\b(make|build|create|write|generate|code|program|implement|set up|setup|design|develop|sketch|draft|prototype|scaffold|spin up|bootstrap|cook up|put together|knock out)\b/;
+  const target =
+    /\b(html|web ?page|website|landing ?page|form|component|button|card|modal|widget|plugin|extension|app|application|game|mini-?game|script|program|bot|cli|tool|dashboard|website|todo list|calculator|simulator|tracker|timer|calendar|markdown|converter|parser|scraper|crawler|api|server|backend|frontend|landing|portfolio|resume|cv|invite|signup|login|signin|signin ?page|signup ?page|styling|layout|stylesheet|theme|python|java|rust|go|golang|hello world|helloworld|hello-world|navbar)\b/;
+  // "menu"/"hero"/"banner" are too generic and false-trigger on "make me a
+  // menu for dinner". Only match when adjacent to web/code context (e.g.
+  // "hero section", "banner ad component", "nav menu").
+  const contextualTarget =
+    /\b(hero section|banner ad|css menu|html menu|nav menu|nav ?bar|navigation|layout)\b/;
+  if (trigger.test(t) && (target.test(t) || contextualTarget.test(t))) return true;
+
+  // Natural "make me a <thing>" / "build a <thing>" with a code-shaped target.
+  if (/\b(make|build|create|write|generate)\b[^.!?\n]{0,20}\bme\b[^.!?\n]{0,8}\ba [^.!?\n]{0,40}\b(game|app|website|web ?page|bot|form|calculator|simulator|todo|chat|tracker|timer|calendar|markdown|converter|parser|scraper|crawler|api|cli|tool|dashboard|mini-?game|widget|plugin|script|program|component|button|card|modal|theme|layout|website|portfolio|resume)\b/i.test(t)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isAgenticModelLocked(modelId) {
+  if (modelId === HYPERION_MODEL_ID && typeof isTitanQuotaLocked === "function") {
+    return !!isTitanQuotaLocked();
+  }
+  if (modelId === DAEDALUS_MODEL_ID && typeof isDaedalusQuotaLocked === "function") {
+    return !!isDaedalusQuotaLocked();
+  }
+  return false;
+}
+
+function pickAgenticCodingModelId() {
+  const sessionModel = (typeof getCurrentSessionModel === "function" && getCurrentSessionModel()) || "";
+  const order = (Array.isArray(AGENTIC_CODING_MODEL_FALLBACKS) && AGENTIC_CODING_MODEL_FALLBACKS.length)
+    ? AGENTIC_CODING_MODEL_FALLBACKS
+    : [AGENTIC_CODING_MODEL_ID];
+  // Build the candidate list and STRIP locked models — best-effort skip any
+  // model whose quota is currently exhausted so we don't 429 mid-task.
+  const candidates = [];
+  if (sessionModel && !candidates.includes(sessionModel)) candidates.push(sessionModel);
+  for (const id of order) {
+    if (!candidates.includes(id)) candidates.push(id);
+  }
+  const unlocked = candidates.filter((id) => !isAgenticModelLocked(id));
+  if (unlocked.length === 0) return AGENTIC_CODING_MODEL_ID;
+  // Prefer the user's current session model if it survived the locked-filter,
+  // otherwise the first unlocked candidate from the preference list.
+  if (sessionModel && unlocked.includes(sessionModel)) return sessionModel;
+  return unlocked[0];
+}
+
+async function runAgenticCodeTask({ userText } = {}) {
+  const text = String(userText || "").trim();
+  if (!text) return { ok: false, error: "Empty prompt" };
+  if (typeof isSending !== "undefined" && isSending) {
+    return { ok: false, error: "Wait for the current ROK action to finish." };
+  }
+
+  // 1) Echo the user message so the chat history stays consistent. We clear
+  //    the input here (not in the caller) so that if anything downstream
+  //    throws, we can restore it via the catch handler without the user
+  //    losing their typed text.
+  addMessage("user", text);
+  if (typeof input !== "undefined" && input) {
+    input.value = "";
+  }
+  if (typeof autoResizeInput === "function") autoResizeInput();
+
+  // 2) Build the tool trace panel so the user sees checked steps (matches the
+  //    visual pattern of the original /agentic UI).
+  const traceMsg = addMessage("bot", "", {
+    toolTrace: true,
+    toolTraceSummary: "ROK is generating code\u2026"
+  });
+  const controller = traceMsg && traceMsg.toolController;
+  if (!controller) return { ok: false, error: "Failed to open tool trace panel." };
+  controller.setHeader("Working");
+  const idCall = controller.addStep({ label: "Calling ROK", status: "running", meta: pickAgenticCodingModelId() });
+  const idParse = controller.addStep({ label: "Parsing response", status: "pending", meta: "" });
+  const idWrite = controller.addStep({ label: "Writing files", status: "pending", meta: "" });
+
+  if (typeof scrollToBottom === "function") scrollToBottom();
+
+  // 3) Build the request body. The agentic coding prompt must stay dominant
+  //    so the model still emits `<rok_file>` blocks; the user's Customize
+  //    prompt is layered on top, not used in place of it.
+  //    Important: do NOT route through withLocalKnowledge() here — that
+  //    helper deletes custom_system_prompt when the user has no override
+  //    and overwrites it when they do, both of which would silently drop
+  //    the agentic instructions. Read the overrides manually and prepend.
+  const sessionModel = pickAgenticCodingModelId();
+  const messagePayload = (typeof buildMessageForApi === "function")
+    ? String(buildMessageForApi(text, ""))
+    : text;
+  let agenticSystemPrompt = AGENTIC_CODING_SYSTEM_PROMPT;
+  if (typeof getCustomPromptOverridesForApi === "function") {
+    try {
+      const overrides = getCustomPromptOverridesForApi();
+      // Cap the user override at CUSTOMIZATION_PROMPT_MAX_CHARS so a giant
+      // pasted prompt doesn't blow up the request body (the regular flow
+      // already enforces this cap upstream — we mirror it).
+      const maxUserChars = (typeof CUSTOMIZATION_PROMPT_MAX_CHARS === "number")
+        ? CUSTOMIZATION_PROMPT_MAX_CHARS
+        : 2400;
+      let userPrompt = (overrides && typeof overrides.customSystemPrompt === "string")
+        ? overrides.customSystemPrompt.trim()
+        : "";
+      if (userPrompt.length > maxUserChars) {
+        userPrompt = userPrompt.slice(0, maxUserChars).trimEnd();
+      }
+      if (userPrompt) {
+        agenticSystemPrompt = agenticSystemPrompt + "\n\n" + userPrompt;
+      }
+    } catch (_) {
+      // Best effort: ignore override-read failures and keep agentic prompt only.
+    }
+  }
+  const baseBody = {
+    message: messagePayload,
+    workspace_context: "",
+    attachments: [],
+    history: [],
+    model: sessionModel,
+    max_tokens: (typeof clientLimits !== "undefined" && clientLimits && clientLimits.maxResponseTokens) || 8192,
+    enable_thinking: false,
+    custom_system_prompt: agenticSystemPrompt,
+    incognito: Boolean(typeof isIncognitoModeEnabled === "function" && isIncognitoModeEnabled())
+  };
+  const requestBody = baseBody;
+
+  // Mark the app busy so spammed clicks don't stack concurrent /api/chat calls.
+  const wasSending = (typeof isSending !== "undefined" && isSending);
+  if (typeof isSending !== "undefined") isSending = true;
+  if (typeof nextAllowedAt !== "undefined" && clientLimits && clientLimits.cooldownMs) {
+    nextAllowedAt = Date.now() + clientLimits.cooldownMs;
+  }
+  if (typeof startCooldownTimer === "function") startCooldownTimer();
+  if (typeof refreshSendState === "function") refreshSendState();
+
+  let fullText = "";
+  let streamError = null;
+  let lastSummaryUpdate = 0;
+  try {
+    if (typeof activeRequestController !== "undefined") {
+      activeRequestController = new AbortController();
+    }
+    const response = await fetchWithBanGuard(API_URL, {
+      method: "POST",
+      headers: buildApiHeaders(true, { modelId: sessionModel }),
+      signal: (typeof activeRequestController !== "undefined" && activeRequestController && activeRequestController.signal) || undefined,
+      body: JSON.stringify(requestBody)
+    });
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (!response.ok || contentType.includes("text/html")) {
+      const errorText = await safeReadResponseText(response);
+      throw new Error(errorText || `ROK request failed (${response.status || "unknown"}).`);
+    }
+    if (typeof applyThinkingQuotaFromHeaders === "function") applyThinkingQuotaFromHeaders(response);
+    if (typeof applyDaedalusQuotaFromHeaders === "function") applyDaedalusQuotaFromHeaders(response);
+
+    const processDataPayload = (payloadStr) => {
+      if (!payloadStr || payloadStr === "[DONE]") return;
+      let parsed;
+      try { parsed = JSON.parse(payloadStr); } catch (_) { return; }
+      if (parsed && typeof parsed.token === "string") {
+        fullText += parsed.token;
+        // Throttle DOM updates to ~4Hz so we don't thrash on long generations.
+        const now = Date.now();
+        if (now - lastSummaryUpdate > 250) {
+          lastSummaryUpdate = now;
+          controller.setSummary(`ROK is generating code\u2026 ${fullText.length} chars`);
+        }
+      }
+      // Ignore thinking traces / tool_calls / web_search / status / etc.
+    };
+
+    if (contentType.includes("text/event-stream")) {
+      const reader = response.body && response.body.getReader && response.body.getReader();
+      if (reader) {
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        let streamDone = false;
+        while (!streamDone) {
+          const { value, done: readDone } = await reader.read();
+          if (readDone) { streamDone = true; break; }
+          buffer += decoder.decode(value, { stream: true });
+          let blockIdx;
+          while ((blockIdx = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, blockIdx);
+            buffer = buffer.slice(blockIdx + 2);
+            for (const line of block.split("\n")) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data:")) continue;
+              processDataPayload(trimmed.slice(5).trim());
+            }
+          }
+        }
+        // Drain any trailing buffer the provider left without a final
+        // \n\n separator — the existing chat flow does this too.
+        if (buffer.trim()) {
+          for (const line of buffer.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data:")) continue;
+            processDataPayload(trimmed.slice(5).trim());
+          }
+        }
+      }
+    } else {
+      // Fall back to single-shot JSON if the server returned JSON instead of SSE.
+      const rawText = await safeReadResponseText(response);
+      let parsed = null;
+      try { parsed = JSON.parse(rawText); } catch (_) { parsed = null; }
+      if (parsed && typeof parsed.reply === "string") fullText = parsed.reply;
+      else if (parsed && typeof parsed.response === "string") fullText = parsed.response;
+      else if (typeof parsed === "string") fullText = parsed;
+      else if (rawText) fullText = rawText;
+    }
+    // Force the final summary update so the user sees the real character count
+    // even when the throttle would have suppressed the last write.
+    controller.setSummary(`ROK is generating code\u2026 ${fullText.length} chars`);
+  } catch (err) {
+    streamError = err;
+    controller.updateStep(idCall, { status: "error", meta: "stream failed" });
+    // Restore the user's typed text so they can retry with a small tweak.
+    if (typeof input !== "undefined" && input) {
+      input.value = text;
+    }
+    if (typeof autoResizeInput === "function") autoResizeInput();
+  } finally {
+    // Always release the busy flag, even if we bailed out via the catch.
+    if (typeof isSending !== "undefined") isSending = wasSending;
+    if (typeof refreshSendState === "function") refreshSendState();
+  }
+
+  controller.updateStep(idCall, {
+    status: streamError ? "error" : "done",
+    meta: streamError ? String((streamError && streamError.message) || streamError).slice(0, 60) : `${fullText.length} chars`
+  });
+
+  // 4) Parse the model's reply for code blocks.
+  controller.updateStep(idParse, { status: "running" });
+  const files = parseAgenticCodeBlocks(fullText);
+  controller.updateStep(idParse, {
+    status: "done",
+    meta: `${files.length} file${files.length === 1 ? "" : "s"}`
+  });
+
+  // 5) Persist each file via the existing file-tool pipeline. The backend
+  //    falls back to passthrough on Render, and the client code further falls
+  //    back to localStorage when the backend is unavailable, so files survive
+  //    server restarts.
+  const written = [];
+  const failed = [];
+  if (files.length > 0) {
+    controller.updateStep(idWrite, { status: "running", meta: files[0].path });
+    for (const file of files) {
+      try {
+        const result = await executeBackendFileTool("write_file", {
+          path: file.path,
+          content: file.content
+        });
+        if (result && result.ok) {
+          written.push({ path: file.path, lines: countStringLines(file.content) });
+        } else {
+          failed.push({ path: file.path, error: (result && result.error) || "write failed" });
+        }
+      } catch (e) {
+        failed.push({ path: file.path, error: String((e && e.message) || e) });
+      }
+    }
+    controller.updateStep(idWrite, {
+      status: failed.length === 0 ? "done" : (written.length === 0 ? "error" : "running"),
+      meta: written.length ? `${written.length}/${files.length} ok` : "all failed"
+    });
+  } else {
+    controller.updateStep(idWrite, {
+      status: "error",
+      meta: "no code blocks found"
+    });
+  }
+
+  // 6) Compose the summary so the chat stays accurate. If parsing failed or
+  //    the LLM had nothing useful to say, surface the raw reply as a normal
+  //    bot message so the user can read what the model actually produced
+  //    (and re-prompt with better instructions).
+  let summaryText;
+  let showRawReply = false;
+  if (written.length === 0 && failed.length === 0 && streamError) {
+    summaryText = `Couldn't reach ROK: ${(streamError && streamError.message) || streamError}`;
+  } else if (written.length === 0 && failed.length > 0) {
+    summaryText = `Couldn't write files - ${failed[0].error}`;
+  } else if (written.length === 0 && files.length === 0) {
+    summaryText = "No code blocks found in the reply. Showing ROK's answer below.";
+    showRawReply = true;
+  } else {
+    summaryText =
+      `Created ${written.map((w) => "`" + w.path + "`").join(", ")} in browser storage` +
+      (written.length && written[0].lines ? ` (${written[0].lines} lines)` : "") +
+      (failed.length ? ` - ${failed.length} failed` : "");
+  }
+  controller.setSummary(summaryText);
+  controller.setHeader(streamError && written.length === 0 ? "Stopped" : "Done");
+
+  if (showRawReply && fullText.trim() && typeof addMessage === "function") {
+    try {
+      addMessage("bot", fullText, { markdown: true });
+    } catch (_) {
+      // Best-effort: if markdown rendering fails, fall back to plain text.
+      try { addMessage("bot", fullText); } catch (_) { /* ignore */ }
+    }
+  }
+
+  // 7) Push a minimal assistant marker into history so reload shows the trace
+  //    in the chat. We persist just the summary; the per-step trace is
+  //    ephemeral by design.
+  if (typeof history !== "undefined" && Array.isArray(history)) {
+    history.push({ role: "assistant", content: summaryText });
+    try {
+      syncCurrentSessionFromHistory && syncCurrentSessionFromHistory();
+    } catch (_) {}
+  }
+  if (typeof scrollToBottom === "function") scrollToBottom();
+  return {
+    ok: written.length > 0 || (files.length === 0 && !streamError),
+    summary: summaryText,
+    files: written,
+    failed
+  };
+}
+
 function countStringLines(s) {
   const text = String(s || "");
   if (!text) return 0;
@@ -15168,9 +15623,19 @@ async function send() {
   if (text && /^\/agentic\b/i.test(text)) {
     const prompt = text.replace(/^\/agentic\b\s*/i, "").trim();
     if (prompt) {
-      input.value = "";
-      autoResizeInput();
-      runAgenticTask({ userText: prompt }).catch((err) => {
+      // runAgenticCodeTask clears the input itself AFTER addMessage echoes it
+      // and restores it on stream failure.
+      // Hard requirement: the new real generator must be loaded. We do NOT
+      // silently fall back to the legacy stub — that path produced broken
+      // placeholder HTML and is exactly the bug this command is supposed to
+      // replace. Show a clear system message instead.
+      if (typeof runAgenticCodeTask !== "function") {
+        if (typeof addMessage === "function") {
+          addMessage("system", "Agentic code generator not loaded — refresh the page and retry.");
+        }
+        return;
+      }
+      runAgenticCodeTask({ userText: prompt }).catch((err) => {
         console.error("agentic run failed", err);
         addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
       });
@@ -15184,6 +15649,35 @@ async function send() {
     autoResizeInput();
     handlePictionaryCommand();
     return;
+  }
+
+  // Auto-detect coding requests so ROK uses the real LLM-backed agentic
+  // tool caller (writes actual code to browser storage) without the user
+  // needing to type `/agentic`. Disabled in incognito mode so incidental
+  // prompts in a private session don't trigger file writes.
+  if (
+    text &&
+    typeof looksLikeCodingRequest === "function" &&
+    looksLikeCodingRequest(text) &&
+    typeof runAgenticCodeTask === "function" &&
+    !(typeof isIncognitoModeEnabled === "function" && isIncognitoModeEnabled())
+  ) {
+    const codingPrompt = text.trim();
+    if (codingPrompt) {
+      // runAgenticCodeTask clears the input itself AFTER addMessage echoes it
+      // and restores it on stream failure — so we don't clear here.
+      runAgenticCodeTask({ userText: codingPrompt }).catch((err) => {
+        console.error("auto agentic run failed", err);
+        if (typeof addMessage === "function") {
+          addMessage(
+            "system",
+            `Agentic run failed: ${err && err.message ? err.message : err}. ` +
+              `Restore your prompt, switch off auto-agentic in Customize, or retry in a moment.`
+          );
+        }
+      });
+      return;
+    }
   }
 
   if (await tryHandleNaturalBrowserPilotAgent(text, attachments)) {
