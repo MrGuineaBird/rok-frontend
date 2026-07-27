@@ -13194,7 +13194,6 @@ function createToolCallsPanel(initialSummary = "") {
 
     const entry = { id: stepId, status, label: stepLabelEl, icon: stepIcon, meta: stepMeta, node: li };
     steps.push(entry);
-    visibleCount = steps.length;
     refreshCount();
     scrollToBottom();
     return stepId;
@@ -13439,7 +13438,7 @@ async function runAgenticTask({ userText } = {}) {
   addMessage("user", text);
 
   // 2) Build the tool-calls bubble (returns a controller via .toolController).
-  const traceMsg = addMessage("assistant", "", {
+  const traceMsg = addMessage("bot", "", {
     toolTrace: true,
     toolTraceSummary: ""
   });
