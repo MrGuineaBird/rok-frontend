@@ -10766,6 +10766,21 @@ function getDefaultModelForNewSession() {
   return normalizeSessionModel(preferred || DEFAULT_MODEL_ID);
 }
 
+// Session mode controls whether the chat streams through the regular chat
+// path or the multi-turn agentic loop. "chat" keeps the original UX; "code"
+// is unlocked ONLY by the /agentic slash command (per design constraint —
+// there's no UI toggle to enter "code"). Once a session is in "code" mode,
+// every subsequent message in that chat runs through runAgenticCodeTask with
+// up to ROK_AGENTIC_MAX_AGENTIC_TURNS turns. /chat <text> flips it back.
+const ROK_SESSION_MODE_CHAT = "chat";
+const ROK_SESSION_MODE_CODE = "code";
+
+function normalizeSessionMode(rawMode) {
+  const value = String(rawMode || "").trim().toLowerCase();
+  if (value === ROK_SESSION_MODE_CODE) return ROK_SESSION_MODE_CODE;
+  return ROK_SESSION_MODE_CHAT;
+}
+
 function createSession(messages = []) {
   const now = Date.now();
   const safeMessages = sanitizeMessages(messages);
@@ -10777,7 +10792,8 @@ function createSession(messages = []) {
     messages: safeMessages,
     model: getDefaultModelForNewSession(),
     workspace: createDefaultWorkspace(),
-    memory: createDefaultSessionMemory()
+    memory: createDefaultSessionMemory(),
+    mode: ROK_SESSION_MODE_CHAT
   };
 }
 
@@ -10838,6 +10854,7 @@ function loadSessionsFromStorage() {
       const title = typeof item.title === "string" && item.title.trim() ? item.title.trim() : buildSessionTitle(safeMessages);
       const workspace = normalizeWorkspace(item.workspace);
       const model = normalizeSessionModel(item.model);
+      const mode = normalizeSessionMode(item.mode);
       loaded.push({
         id,
         title: title || "New Chat",
@@ -10846,7 +10863,8 @@ function loadSessionsFromStorage() {
         messages: safeMessages,
         model,
         workspace,
-        memory: normalizeSessionMemory(item.memory)
+        memory: normalizeSessionMemory(item.memory),
+        mode
       });
     }
 
@@ -10895,8 +10913,29 @@ function updateCurrentSessionButton() {
   if (!currentSessionBtn) return;
   const current = getSessionById(currentSessionId);
   const label = current && current.title ? current.title : "Current Session";
-  currentSessionBtn.textContent = `Current: ${label}`;
-  currentSessionBtn.title = label;
+  // Mode pill is read-only display — the only way to flip a chat into
+  // Code mode is the /agentic slash command, and the only way to leave is
+  // /chat. The user explicitly said there should be no UI toggle.
+  const mode = current ? normalizeSessionMode(current.mode) : ROK_SESSION_MODE_CHAT;
+  const modeBadge = mode === ROK_SESSION_MODE_CODE ? " \u00b7 \ud83d\udd27 Code" : "";
+  currentSessionBtn.textContent = `Current: ${label}${modeBadge}`;
+  currentSessionBtn.title = mode === ROK_SESSION_MODE_CODE
+    ? `${label} (Code mode — multi-turn agentic loop)`
+    : `${label} (Chat mode)`;
+  if (mode === ROK_SESSION_MODE_CODE) {
+    currentSessionBtn.classList.add("is-code-mode");
+  } else {
+    currentSessionBtn.classList.remove("is-code-mode");
+  }
+}
+
+// Compatibility alias used by the /agentic and /chat slash commands when
+// they flip a chat's mode. Re-rendering the session button is enough to
+// show the new pill — the rest of the chat UI updates the next time
+// renderConversation() runs.
+function renderChatModePill(chat) {
+  void chat;
+  updateCurrentSessionButton();
 }
 
 function renderSavedSessions() {
@@ -13225,15 +13264,18 @@ function populateBotMessageContainer(container, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Agentic tool-caller block (Claude Code / Codex style).
-// createToolCallsPanel() returns a panel + controller object so callers can:
+// Agentic tool-caller block (Claude Code / Codex style).  // createToolCallsPanel() returns a panel + controller object so callers can:
+
 //   - add steps as the runner discovers them
 //   - flip a step's status between pending / running / done / error
 //   - rewrite the header (Working ▾, Done ▾, Stopped ▾ …)
 //   - stamp a summary line ("Created `flappy_bird.html` ...")
+//   - optionally show a Cancel button — wired for the multi-turn agentic loop
+//     so the user can abort mid-run without leaving a dangling fetch
 // Matching CSS lives in style.css under `.tool-calls-*`.
 // ---------------------------------------------------------------------------
-function createToolCallsPanel(initialSummary = "") {
+function createToolCallsPanel(initialSummary = "", options = {}) {
+  const cancelCallback = options && typeof options.onCancel === "function" ? options.onCancel : null;
   const shell = document.createElement("details");
   shell.className = "tool-calls-block is-open";
   shell.open = true;
@@ -13253,6 +13295,27 @@ function createToolCallsPanel(initialSummary = "") {
   const count = document.createElement("span");
   count.className = "tool-calls-summary-count";
   count.textContent = "0 steps";
+
+  // Inline Cancel button. Always present in the DOM but only visible when a
+  // cancel callback has been wired (run-agentic loops pass one in so the
+  // user can abort multi-turn runs; the regular single-pass flows leave it
+  // hidden). Hot-loaded via setCancelCallback() after addMessage creates the
+  // panel — the wired callback may not exist at panel-construction time.
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "tool-calls-cancel-btn";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.title = "Stop the multi-turn agentic run";
+  cancelBtn.hidden = !cancelCallback;
+  let cancelCallbackRef = cancelCallback;
+  cancelBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (cancelCallbackRef) {
+      try { cancelCallbackRef(); } catch (_) {}
+    }
+  });
+  summary.appendChild(cancelBtn);
 
   const arrow = document.createElement("span");
   arrow.className = "tool-calls-summary-arrow";
@@ -13307,6 +13370,12 @@ function createToolCallsPanel(initialSummary = "") {
     const finished = /done|stop|cancel|complete|fail|error/i.test(String(text || ""));
     if (finished) {
       shell.classList.add("is-finished");
+      // Once the run is finished there's nothing left to cancel — drop the
+      // button so it doesn't dangle at the bottom of the summary line.
+      if (cancelBtn && cancelBtn.parentNode) {
+        cancelBtn.parentNode.removeChild(cancelBtn);
+        cancelCallbackRef = null;
+      }
     }
   }
 
@@ -13516,7 +13585,15 @@ function createToolCallsPanel(initialSummary = "") {
    setOpen,
     toggle,
     snapshot,
-    refreshCount
+    refreshCount,
+    // Late-bind the cancel handler so callers that construct the panel via
+    // addMessage() (which doesn't know about the AbortController) can still
+    // wire the Cancel button afterwards. Mirrors the setHeader / setSummary
+    // late-binding pattern.
+    setCancelCallback(fn) {
+      cancelCallbackRef = typeof fn === "function" ? fn : null;
+      if (cancelBtn) cancelBtn.hidden = !cancelCallbackRef;
+    }
   };
 }
 
@@ -13570,6 +13647,13 @@ const ROK_LAST_AGENTIC_RUN = {
   primaryPath: "",
   ts: 0
 };
+// Multi-turn agentic loop caps. Cap is intentionally low so a stuck agent
+// burns out before it eats 8x the prompt tokens on a quota-limited model.
+// `MAX_TURNS` is the chat-mode cap; user override via the per-call
+// `maxTurns` argument is clamped to `MAX_TURNS + 4` so power users can step
+// further when they actually know what they're doing.
+const ROK_AGENTIC_MAX_TURNS = 8;
+const ROK_AGENTIC_MAX_TURNS_CEILING = ROK_AGENTIC_MAX_TURNS + 4;
 const AGENTIC_FOLLOWUP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
 function hasRecentAgenticContext(now) {
@@ -13943,6 +14027,12 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
       }
       return { ok: false, error: rejectedMessage };
     }
+    // Non-agentic_unavailable error: release busy flags BEFORE re-throwing so
+    // an unexpected provider error doesn't permanently lock the chat. The
+    // outer caller / error log will surface the actual failure.
+    isSending = wasSending;
+    ROK_AGENTIC_RUN_IN_FLIGHT = false;
+    if (typeof refreshSendState === "function") refreshSendState();
     throw pickErr;
   }
   const idParse = controller.addStep({ label: "Collecting tool calls", status: "pending", meta: "" });
@@ -14600,11 +14690,649 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
   };
 }
 
-// extractJsonToolCallsFromProse — locate an OpenAI-style tool_calls JSON
-// block inside plain text. Hermes 1.4 (gpt-oss:120b-cloud) sometimes emits
-// tool_calls as JSON-as-prose instead of using the native tool_calls SSE
-// field. Defensive parser: tolerates ```json``` code fences and prose around
-// the JSON block, ignores truncated / malformed blocks, never throws.
+// ===========================================================================
+// runAgenticCodeTaskMultiTurn — multi-turn replacement for the single-pass
+// runAgenticCodeTask above. Activated ONLY when the chat is in "Code" mode,
+// and Code mode is ONLY entered via the /agentic slash command. The loop is
+// driven from the frontend (we keep the backend stateless) and feeds each
+// model's tool_call results back as {role:"tool"} messages on the next turn.
+//
+// Safety: hard cap on turns (ROK_AGENTIC_MAX_TURNS, default 8), loop
+// detection that bails if the model emits the same tool-call fingerprint
+// twice in a row, and an AbortController wired to the trace panel's Cancel
+// button so the user can stop mid-run. Errors on any single turn short-
+// circuit the loop and write a clear summary.
+//
+// This file does NOT change the backend — build_local_payload already
+// accepts role:"tool" messages with tool_call_id, and the streaming endpoint
+// already emits clean "tool_calls" SSE events + done markers.
+// ===========================================================================
+
+// Serialize one tool execution result into a bounded string for re-feed.
+// Heavy on text — keep compact but readable; cap at 8KB so a runaway file
+// doesn't blow the model's context budget on the next turn.
+function serializeAgenticToolResultForReFeed(toolName, result) {
+  const cap = 8000;
+  const payload = result && result.result ? result.result : {};
+  let body = "";
+  try {
+    if (toolName === "read_file" && typeof payload.content === "string") {
+      body = payload.content;
+    } else if (toolName === "list_files" && Array.isArray(payload.files)) {
+      body = payload.files
+        .map((f) => (f && typeof f === "object" ? (f.path || JSON.stringify(f)) : String(f)))
+        .join("\n");
+    } else {
+      body = JSON.stringify(payload);
+    }
+  } catch (_) {
+    body = String(payload || "");
+  }
+  if (body.length > cap) {
+    body = body.slice(0, cap) + "\n...[truncated]";
+  }
+  return body;
+}
+
+// Stream ONE turn of the agentic loop. Mirrors the per-turn SSE consume
+// logic from runAgenticCodeTask (which was extracted so the multi-turn
+// orchestrator can call it in a loop without touching the existing single-
+// pass path). Returns {text, toolCalls, streamError}. Honors `signal` for
+// cancel via AbortController.
+async function streamAgenticTurnOnce({ messages, sessionModel, signal, controller, idParse }) {
+  const fullText = "";
+  let runningText = "";
+  const toolCalls = [];
+  const toolCallsFingerprints = new Set();
+  let streamError = null;
+  let lastSummaryUpdate = 0;
+
+  // Build the request body. The backend's build_local_payload already
+  // accepts {role:"tool", tool_call_id, content} messages, so we just feed
+  // the running messages array verbatim. Disable the legacy history path
+  // (history: []) so the backend doesn't see the user-text twice.
+  const baseBody = {
+    message: "[multi-turn turn N] see messages[]",
+    messages: messages,
+    workspace_context: "",
+    history: [],
+    model: sessionModel,
+    enable_thinking: true,
+    max_tokens: 4096,
+    stream: true,
+    tools: Array.isArray(AGENTIC_TOOL_DEFINITIONS) ? AGENTIC_TOOL_DEFINITIONS : [],
+    tool_choice: "auto"
+  };
+
+  try {
+    const response = await fetchWithBanGuard(API_URL, {
+      method: "POST",
+      headers: buildApiHeaders(true, { modelId: sessionModel }),
+      body: JSON.stringify(baseBody),
+      signal
+    });
+    if (!response.ok) {
+      let errText = `HTTP ${response.status}`;
+      try { errText = ((await response.text()) || errText).slice(0, 200); } catch (_) {}
+      throw new Error(errText);
+    }
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+
+    const processDataPayload = (payload) => {
+      let parsed = null;
+      try { parsed = JSON.parse(payload); } catch (_) { parsed = null; }
+      if (!parsed || typeof parsed !== "object") return;
+
+      // Token / text accumulation. Support the same legacy shapes the
+      // single-pass path already handles (`{token}`, `{reply}`, `{response}`,
+      // `{message}`, `{content}`, or OpenAI-style `choices[].delta.content`).
+      if (typeof parsed.token === "string") {
+        runningText += parsed.token;
+      } else if (typeof parsed.reply === "string") {
+        runningText += parsed.reply;
+      } else if (typeof parsed.response === "string") {
+        runningText += parsed.response;
+      } else if (typeof parsed.message === "string") {
+        runningText += parsed.message;
+      } else if (typeof parsed.content === "string") {
+        runningText += parsed.content;
+      } else if (Array.isArray(parsed.choices)) {
+        for (const c of parsed.choices) {
+          if (!c || typeof c !== "object") continue;
+          const d = c.delta;
+          if (d && typeof d.content === "string") { runningText += d.content; break; }
+        }
+      }
+      // Throttle the trace summary so we don't thrash the DOM at ~4Hz on
+      // long generations. Same cadence the single-pass path uses.
+      if (runningText !== fullText) {
+        const now = Date.now();
+        if (now - lastSummaryUpdate > 250) {
+          lastSummaryUpdate = now;
+          if (controller && typeof controller.setSummary === "function") {
+            controller.setSummary(`ROK is reasoning… ${runningText.length} chars`);
+          }
+        }
+      }
+
+      // Native tool_calls — both Ollama-native (flat {id, name, arguments})
+      // and OpenAI-wrapped ({id, function:{name, arguments}}) shapes.
+      const rawCalls = Array.isArray(parsed.tool_calls)
+        ? parsed.tool_calls
+        : (Array.isArray(parsed.message && parsed.message.tool_calls) ? parsed.message.tool_calls : null);
+      if (rawCalls && rawCalls.length) {
+        for (const tc of rawCalls) {
+          if (!tc || typeof tc !== "object") continue;
+          let fn;
+          if (tc.function && typeof tc.function === "object") {
+            fn = tc.function;
+          } else if (typeof tc.name === "string") {
+            fn = { name: tc.name, arguments: tc.arguments };
+          } else {
+            fn = {};
+          }
+          const name = String(fn.name || "").trim();
+          if (!name) continue;
+          let argsKey;
+          if (typeof fn.arguments === "string") {
+            argsKey = fn.arguments;
+          } else if (fn.arguments && typeof fn.arguments === "object") {
+            try { argsKey = JSON.stringify(fn.arguments); } catch (_) { argsKey = String(fn.arguments); }
+          } else {
+            argsKey = String(fn.arguments || "");
+          }
+          const fp = `${name}#${argsKey}`;
+          if (toolCallsFingerprints.has(fp)) continue;
+          toolCallsFingerprints.add(fp);
+          toolCalls.push({
+            id: String(tc.id || ""),
+            function: { name, arguments: fn.arguments }
+          });
+        }
+      }
+    };
+
+    if (contentType.includes("text/event-stream")) {
+      const reader = response.body && response.body.getReader && response.body.getReader();
+      if (reader) {
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        let streamDone = false;
+        while (!streamDone) {
+          if (signal && signal.aborted) {
+            try { reader.cancel(); } catch (_) {}
+            break;
+          }
+          const { value, done: readDone } = await reader.read();
+          if (readDone) { streamDone = true; break; }
+          buffer += decoder.decode(value, { stream: true });
+          let blockIdx;
+          while ((blockIdx = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, blockIdx);
+            buffer = buffer.slice(blockIdx + 2);
+            for (const line of block.split("\n")) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data:")) continue;
+              processDataPayload(trimmed.slice(5).trim());
+            }
+          }
+        }
+        if (buffer.trim()) {
+          for (const line of buffer.split("\n")) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith(":") || !trimmed.startsWith("data:")) continue;
+            processDataPayload(trimmed.slice(5).trim());
+          }
+        }
+      }
+    } else {
+      // Fall back to single-shot JSON if the server returned JSON instead.
+      const rawText = await safeReadResponseText(response);
+      let parsed = null;
+      try { parsed = JSON.parse(rawText); } catch (_) { parsed = null; }
+      if (parsed) processDataPayload(JSON.stringify(parsed));
+    }
+
+    if (controller && typeof controller.setSummary === "function") {
+      controller.setSummary(`ROK is generating code… ${runningText.length} chars`);
+    }
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      // Treat AbortError as a clean cancel; the orchestrator's userCancelled
+      // flag (set when the user clicked Cancel) decides whether to record it.
+    } else {
+      streamError = err;
+    }
+  }
+
+  return { text: runningText, toolCalls, streamError };
+}
+
+async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns } = {}) {
+  const text = String(userText || "").trim();
+  if (!text) return { ok: false, error: "Empty prompt" };
+  if (typeof isSending !== "undefined" && isSending) {
+    return { ok: false, error: "Wait for the current ROK action to finish." };
+  }
+  const ctx = recentContext || (
+    typeof safeRecentAgenticContext === "function" ? safeRecentAgenticContext() : null
+  );
+
+  const turnCap = Math.max(
+    1,
+    Math.min(
+      Number(maxTurns) || ROK_AGENTIC_MAX_TURNS,
+      ROK_AGENTIC_MAX_TURNS_CEILING
+    )
+  );
+
+  // Single concurrency window for the entire multi-turn sequence so the
+  // send handler can't fire a parallel /chat at the same time.
+  ROK_AGENTIC_RUN_IN_FLIGHT = true;
+  const wasSending = (typeof isSending !== "undefined" && isSending);
+  if (typeof isSending !== "undefined") isSending = true;
+
+  // Echo the user message + clear input so a stream error doesn't lose text.
+  addMessage("user", text);
+  if (typeof input !== "undefined" && input) input.value = "";
+  if (typeof autoResizeInput === "function") autoResizeInput();
+
+  const traceMsg = addMessage("bot", "", { toolTrace: true });
+  const controller = traceMsg && traceMsg.toolController;
+  if (!controller) {
+    if (typeof isSending !== "undefined") isSending = wasSending;
+    ROK_AGENTIC_RUN_IN_FLIGHT = false;
+    return { ok: false, error: "Failed to open tool trace panel." };
+  }
+  controller.setHeader(`Working · turn 0/${turnCap}`);
+
+  // Cancel wiring — clicking the panel's Cancel button aborts the in-flight
+  // fetch (so the SSE reader exits) AND flips the loop's userCancelled flag
+  // so the next iteration short-circuits before sending another request.
+  const abortController = new AbortController();
+  let userCancelled = false;
+  if (typeof controller.setCancelCallback === "function") {
+    controller.setCancelCallback(() => {
+      userCancelled = true;
+      try { abortController.abort(); } catch (_) {}
+    });
+  }
+
+  // Resolve the agentic coding model BEFORE any network round-trip so a
+  // locked-Hermes-no-fallback rejection surfaces in the trace panel cleanly.
+  let sessionModel;
+  const idCall = controller.addStep({ label: "Calling ROK", status: "running", meta: "picking model" });
+  try {
+    sessionModel = pickAgenticCodingModelId();
+    controller.updateStep(idCall, { label: "Calling ROK", status: "running", meta: sessionModel });
+  } catch (pickErr) {
+    if (pickErr && pickErr.code === "agentic_unavailable") {
+      controller.updateStep(idCall, { status: "error", meta: "all coding models locked" });
+      controller.setHeader("Stopped");
+      controller.setSummary(String(pickErr.message || "All coding models are locked. Wait or add your own Ollama API key in Customize."));
+      if (typeof input !== "undefined" && input) input.value = text;
+      if (typeof autoResizeInput === "function") autoResizeInput();
+      if (typeof isSending !== "undefined") isSending = wasSending;
+      if (typeof refreshSendState === "function") refreshSendState();
+      ROK_AGENTIC_RUN_IN_FLIGHT = false;
+      const rejectedMessage = String(pickErr.message || "All coding models are locked.");
+      if (typeof addMessage === "function") addMessage("system", `[agentic_rejected] ${rejectedMessage}`);
+      if (typeof history !== "undefined" && Array.isArray(history)) {
+        history.push({
+          role: "system",
+          content: `[agentic_rejected] ${rejectedMessage}`,
+          rok: { systemKind: "agentic_rejected", lockedUntilSec: Number(pickErr.lockedUntilSec) || 0 }
+        });
+        try { syncCurrentSessionFromHistory && syncCurrentSessionFromHistory(); } catch (_) {}
+      }
+      return { ok: false, error: rejectedMessage };
+    }
+    // Non-agentic_unavailable error: release busy flags BEFORE re-throwing so
+    // an unexpected provider error doesn't permanently lock the chat. The
+    // outer caller / error log will surface the actual failure.
+    isSending = wasSending;
+    ROK_AGENTIC_RUN_IN_FLIGHT = false;
+    if (typeof refreshSendState === "function") refreshSendState();
+    throw pickErr;
+  }
+  controller.addStep({ label: "Collecting tool calls", status: "pending", meta: "" });
+
+  if (typeof scrollToBottom === "function") scrollToBottom();
+
+  // Build the initial messages array. The system prompt is layered with the
+  // edit-followup addendum so an in-context edit (chat.mode === "code" + a
+  // recent write_file) gets explicit `path` instructions and the contents of
+  // the most recent file inlined so the model can `edit_file` in one shot.
+  const baseMessagePayload = (typeof buildMessageForApi === "function")
+    ? String(buildMessageForApi(text, ""))
+    : text;
+  const messagePayload = (text.length < 25
+    && typeof AGENTIC_SHORT_PROMPT_AUGMENTER === "string"
+    && AGENTIC_SHORT_PROMPT_AUGMENTER)
+    ? `${baseMessagePayload}${AGENTIC_SHORT_PROMPT_AUGMENTER}`
+    : baseMessagePayload;
+  let editContextLine = "";
+  if (ctx && (ctx.primaryPath || (ctx.files && ctx.files[0]))) {
+    const safePrimary = escapeAgenticPromptPath(ctx.primaryPath || ctx.files[0]);
+    const others = (ctx.files || [])
+      .filter((p) => p !== (ctx.primaryPath || ctx.files[0]))
+      .map(escapeAgenticPromptPath);
+    editContextLine =
+      `\n\nSession context: the user's most recently generated file in this session is ` +
+      `\`${safePrimary}\`` +
+      (others.length ? ` (also present: ${others.map((p) => "`" + p + "`").join(", ")})` : "") +
+      `. The current message is a followup edit — to modify \`${safePrimary}\`, ` +
+      `prefer the \`edit_file\` tool with a surgical \`old_string\`-to-\`new_string\` change; ` +
+      `for large rewrites use \`write_file\` with the COMPLETE updated content. ` +
+      `Always pass the \`path\` parameter set to \`${safePrimary}\`.`;
+  }
+  // EDIT-FOLLOWUP: pre-read the existing file contents so the model can edit
+  // on turn 1 without first issuing a discovery list_files/read_file (which
+  // a single-pass runner would have no opportunity to feed back). The multi-
+  // turn runner could ALSO chain list_files → read_file → edit_file natively,
+  // but pre-reading keeps the in-context edit on a single turn when possible
+  // and matches what the existing single-pass path does.
+  let editWorkspaceContext = "";
+  if (ctx && (ctx.primaryPath || (ctx.files && ctx.files[0]))) {
+    const targetPath = ctx.primaryPath || ctx.files[0];
+    const mentionedFileMatch = text.match(/\b([a-z0-9_][\w-]*\.(?:html?|js|ts|jsx?|tsx|mjs|cjs|css|scss|json|py|rb|go|rs|java|kt|swift|dart|lua|php|c|cpp|cxx|h|hpp|sh|bash|zsh|sql|ya?ml|toml|xml|svg|md|markdown|txt|csv))\b/i);
+    const mentionsDifferentFile = mentionedFileMatch &&
+      mentionedFileMatch[1].toLowerCase() !== String(targetPath).toLowerCase();
+    if (!mentionsDifferentFile) {
+      try {
+        let readResult = executeLocalFileTool("read_file", { path: targetPath });
+        if (!readResult || !readResult.ok) {
+          readResult = await executeBackendFileTool("read_file", { path: targetPath });
+        }
+        if (readResult && readResult.ok && readResult.result && typeof readResult.result.content === "string") {
+          const rawContent = readResult.result.content;
+          const cap = 10000;
+          const truncated = rawContent.length > cap;
+          const content = truncated ? rawContent.slice(0, cap) : rawContent;
+          editWorkspaceContext =
+            `Current contents of \`${targetPath}\` (the file the user wants to edit):\n` +
+            "```\n" + content + "\n```\n" +
+            (truncated ? `\n[File truncated — showing first ${cap} of ${rawContent.length} chars.]\n` : "") +
+            `\nEdit this file directly: use edit_file with an old_string that appears EXACTLY once, or write_file with the FULL updated content. Do NOT call list_files or read_file first — the contents are above.`;
+        }
+      } catch (_) { /* fall through — model will discover */ }
+    }
+  }
+
+  // The running messages array. The orchestrator pushes the assistant turn
+  // (text + tool_calls) and tool role results back here after each iteration
+  // so the next request sees the full conversation so far.
+  const messages = [
+    { role: "system", content: AGENTIC_CODING_SYSTEM_PROMPT + editContextLine + editWorkspaceContext },
+    { role: "user", content: messagePayload }
+  ];
+
+  // ===== Multi-turn loop =====
+  const allWritten = [];
+  const allFailed = [];
+  let lastText = "";
+  let streamError = null;
+  let turn = 0;
+  let prevToolCallHash = null;
+  let sameHashCount = 0;
+  let loopDetected = false;
+  let hitTurnCap = false;
+  let parseStepId = null;
+
+  while (turn < turnCap && !userCancelled && !streamError) {
+    turn++;
+    controller.setHeader(`Working · turn ${turn}/${turnCap}`);
+    parseStepId = controller.addStep({
+      label: `Collecting tool calls (turn ${turn}/${turnCap})`,
+      status: "running",
+      meta: ""
+    });
+
+    const oneTurn = await streamAgenticTurnOnce({
+      messages,
+      sessionModel,
+      signal: abortController.signal,
+      controller,
+      idParse: parseStepId
+    });
+
+    if (userCancelled) {
+      controller.updateStep(parseStepId, { status: "skipped", meta: "cancelled" });
+      break;
+    }
+
+    if (oneTurn.streamError) {
+      streamError = oneTurn.streamError;
+      controller.updateStep(parseStepId, { status: "error", meta: "stream failed" });
+      break;
+    }
+
+    lastText = oneTurn.text;
+    controller.updateStep(parseStepId, {
+      status: "done",
+      meta: `${oneTurn.text.length} chars, ${oneTurn.toolCalls.length} call(s)`
+    });
+
+    // Append the assistant message (text + tool_calls together so the next
+    // turn sees both). If the model emitted only prose with no tool calls,
+    // that's still a valid final answer — we just won't iterate again.
+    const assistantMsg = { role: "assistant" };
+    if (oneTurn.text) assistantMsg.content = oneTurn.text;
+    if (oneTurn.toolCalls.length > 0) assistantMsg.tool_calls = oneTurn.toolCalls;
+    messages.push(assistantMsg);
+
+    if (oneTurn.toolCalls.length === 0) break; // assistant finished naturally
+
+    // Loop detection: if the same tool-call fingerprint repeats across three
+    // consecutive turns the agent is stuck. Two consecutive dupes is too
+    // aggressive — legitimate debugging cycles (read → think → read same
+    // file) produce two consecutive identical reads, and we don't want to
+    // bail mid-debug. Three in a row is a strong "agent is stuck" signal.
+    const fp = oneTurn.toolCalls.map((tc) => {
+      const args = typeof tc.function.arguments === "string"
+        ? tc.function.arguments
+        : JSON.stringify(tc.function.arguments || {});
+      return `${tc.function.name}#${args}`;
+    }).sort().join("|");
+    if (fp === prevToolCallHash) {
+      sameHashCount++;
+      if (sameHashCount >= 3) {
+        loopDetected = true;
+        break;
+      }
+    } else {
+      prevToolCallHash = fp;
+      sameHashCount = 1;
+    }
+
+    // Execute each tool call. executeBackendFileTool already falls back to
+    // executeLocalFileTool (browser localStorage) when the backend is in
+    // passthrough mode — so this works on Render too.
+    const idWriteThisTurn = controller.addStep({
+      label: `Executing tools (turn ${turn}/${turnCap})`,
+      status: "running",
+      meta: `${oneTurn.toolCalls.length} call(s)`
+    });
+
+    const toolResults = [];
+    for (const tc of oneTurn.toolCalls) {
+      const toolName = String(tc.function.name || "").trim();
+      if (!toolName) {
+        toolResults.push({ tool_call_id: String(tc.id || ""), content: "Error: missing tool name" });
+        continue;
+      }
+
+      let args = {};
+      const raw = tc.function.arguments;
+      if (typeof raw === "string") {
+        try { args = JSON.parse(raw) || {}; } catch (_) { args = {}; }
+      } else if (raw && typeof raw === "object") {
+        args = raw;
+      }
+
+      // Path safety for write/edit_file (mirrors the single-pass guard).
+      const needsPath = toolName === "write_file" || toolName === "edit_file";
+      if (needsPath && args.path) {
+        const safePath = String(args.path);
+        if (
+          safePath.split("/").some((seg) => seg === "" || seg === "." || seg === "..") ||
+          !/^[A-Za-z0-9_./-]+$/.test(safePath) ||
+          !/\.[A-Za-z0-9]{1,6}$/.test(safePath)
+        ) {
+          toolResults.push({
+            tool_call_id: String(tc.id || ""),
+            content: `Error: invalid path "${safePath.slice(0, 80)}"`
+          });
+          continue;
+        }
+      }
+
+      const stepId = controller.addStep({
+        label: toolName,
+        status: "running",
+        meta: String(args.path || args.query || "").slice(0, 60)
+      });
+
+      try {
+        const result = await executeBackendFileTool(toolName, args);
+        if (result && result.ok) {
+          const doneMeta = (result.result && (result.result.path || result.result.name)) || "ok";
+          controller.updateStep(stepId, { status: "done", meta: doneMeta });
+          toolResults.push({
+            tool_call_id: String(tc.id || ""),
+            content: serializeAgenticToolResultForReFeed(toolName, result)
+          });
+          if (needsPath && args.path) {
+            allWritten.push({
+              path: args.path,
+              lines: (result.result && (result.result.lines || result.result.newLines)) || 0
+            });
+          }
+        } else {
+          const errMsg = (result && result.error) || "tool call failed";
+          controller.updateStep(stepId, { status: "error", meta: errMsg.slice(0, 60) });
+          toolResults.push({
+            tool_call_id: String(tc.id || ""),
+            content: `Error: ${errMsg}`
+          });
+          if (needsPath && args.path) allFailed.push({ path: args.path, error: errMsg });
+        }
+      } catch (err) {
+        const errMsg = String((err && err.message) || err);
+        controller.updateStep(stepId, { status: "error", meta: errMsg.slice(0, 60) });
+        toolResults.push({
+          tool_call_id: String(tc.id || ""),
+          content: `Error: ${errMsg}`
+        });
+        if (needsPath && args.path) allFailed.push({ path: args.path, error: errMsg });
+      }
+    }
+
+    controller.updateStep(idWriteThisTurn, {
+      status: allFailed.length === 0 ? "done" : (allWritten.length === 0 ? "error" : "running"),
+      meta: `${allWritten.length} written`
+    });
+
+    // Re-feed each tool result back to the model as a `tool` role message.
+    // The backend's build_local_payload already maps role:"tool" + tool_call_id
+    // through to Ollama / OpenAI correctly.
+    for (const tr of toolResults) {
+      messages.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
+    }
+  }
+
+  if (turn >= turnCap && !userCancelled && !streamError && !loopDetected) {
+    hitTurnCap = true;
+  }
+
+  // ===== Summary =====
+// All summary composition + flag cleanup happens inside try/finally. The
+// finally clause releases the busy flags so an unexpected exception during
+// summary writing (or anywhere downstream of the loop) doesn't permanently
+// lock the chat from /agentic / send.
+try {
+  let summaryText;
+  if (userCancelled) {
+    summaryText = `Stopped by user after turn ${turn}/${turnCap}` +
+      (allWritten.length ? ` \u00b7 wrote ${allWritten.length} file(s) before stopping` : "");
+  } else if (streamError) {
+    if (allWritten.length === 0) {
+      summaryText = `Couldn't reach ROK: ${(streamError && streamError.message) || streamError}`;
+    } else {
+      summaryText = `Stopped \u2014 wrote ${allWritten.map((w) => "`" + w.path + "`").join(", ")} before error`;
+    }
+  } else if (loopDetected) {
+    summaryText = `Stopped at turn ${turn}/${turnCap}: agent repeated the same tool calls back-to-back. ` +
+      (allWritten.length ? `Wrote ${allWritten.length} file(s) before stopping.` : "No files were written.");
+  } else if (hitTurnCap) {
+    summaryText = `Stopped at turn ${turn}/${turnCap} (max turns reached)` +
+      (allWritten.length ? ` \u00b7 wrote ${allWritten.length} file(s)` : "");
+  } else if (allWritten.length > 0) {
+    summaryText = `Created ${allWritten.map((w) => "`" + w.path + "`").join(", ")} in browser storage` +
+      (allFailed.length ? ` - ${allFailed.length} failed` : "") +
+      (turn > 1 ? ` \u00b7 ${turn} turn(s)` : "");
+  } else if (allFailed.length > 0) {
+    summaryText = `Couldn't write files - ${allFailed[0].error}`;
+  } else {
+    const prose = String(lastText || "").replace(/\s+/g, " ").trim().slice(0, 280);
+    if (prose) {
+      summaryText = `No tool calls in ROK's reply: "${prose}${lastText.length > 280 ? "\u2026" : ""}"`;
+    } else {
+      // Empty reply — mirror the existing single-pass empty-reply copy so
+      // users see consistent messaging across both paths.
+      const shortPromptHint = text.length < 25
+        ? ` Your prompt is short (${text.length} chars) - try a longer directive one, e.g. "make a flappy bird game in a single HTML file called flappy_bird.html".`
+        : "";
+      const hermesLockRemainingSec = (typeof getHermesLockedSecondsRemaining === "function")
+        ? Number(getHermesLockedSecondsRemaining()) || 0
+        : 0;
+      let modelHint;
+      if (hermesLockRemainingSec > 0) {
+        const waitMins = Math.max(1, Math.ceil(hermesLockRemainingSec / 60));
+        modelHint = ` Hermes 1.4 (gpt-oss:120b-cloud) hit its shared daily rate limit - wait about ${waitMins} minute${waitMins === 1 ? "" : "s"} or add your own Ollama API key in Customize to bypass the shared cap.`;
+      } else {
+        modelHint = ` Hermes 1.4 (gpt-oss:120b-cloud) returned no tool calls and no text for this /agentic run. Retry the request, or check /api/agentic/status if the failure keeps happening.`;
+      }
+      summaryText = `No tool calls in ROK's reply \u2014 the model returned empty.` + shortPromptHint + modelHint;
+    }
+  }
+  controller.setSummary(summaryText);
+  controller.setHeader(
+    userCancelled || streamError || loopDetected || hitTurnCap ? "Stopped" : "Done"
+  );
+
+  // Remember what we just wrote so the next user message in this chat can
+  // be auto-routed back into a followup multi-turn run if mode is still
+  // "code" (or fall through to single-pass edit-followup if mode is "chat").
+  if (allWritten.length > 0) {
+    ROK_LAST_AGENTIC_RUN.files = allWritten.map((w) => w.path);
+    ROK_LAST_AGENTIC_RUN.primaryPath = allWritten[0].path;
+    ROK_LAST_AGENTIC_RUN.ts = Date.now();
+  }
+
+  if (typeof history !== "undefined" && Array.isArray(history)) {
+    history.push({ role: "assistant", content: summaryText });
+    try { syncCurrentSessionFromHistory && syncCurrentSessionFromHistory(); } catch (_) {}
+  }
+  if (typeof scrollToBottom === "function") scrollToBottom();
+
+  return {
+    ok: allWritten.length > 0 || (!streamError && !userCancelled && !loopDetected && !hitTurnCap),
+    summary: summaryText,
+    files: allWritten,
+    failed: allFailed,
+    turns: turn,
+    cancelled: userCancelled,
+    loopDetected,
+    hitTurnCap
+  };
+} finally {
+  if (typeof isSending !== "undefined") isSending = wasSending;
+  ROK_AGENTIC_RUN_IN_FLIGHT = false;
+  if (typeof refreshSendState === "function") refreshSendState();
+}
+}
+
 function extractJsonToolCallsFromProse(rawText) {
   const text = String(rawText || "");
   if (!text) return [];
@@ -16234,30 +16962,85 @@ async function send() {
     }
   }
 
-  // Handle /agentic command — runs the task through the agentic tool-caller
-  // UI (Claude Code / Codex style trace with checkmarks). Usage:
+  // Handle /agentic command — the ONLY path that flips a chat into "Code"
+  // mode. From here on, every message in this chat is routed through the
+  // multi-turn agentic loop (runAgenticCodeTaskMultiTurn) instead of the
+  // per-message intent classifier. /chat reverts the mode if the user
+  // changes their mind.
   //   /agentic make a flappy bird in one html file
   if (text && /^\/agentic\b/i.test(text)) {
     const prompt = text.replace(/^\/agentic\b\s*/i, "").trim();
     if (prompt) {
-      // runAgenticCodeTask clears the input itself AFTER addMessage echoes it
-      // and restores it on stream failure.
-      // Hard requirement: the new real generator must be loaded. We do NOT
-      // silently fall back to the legacy stub — that path produced broken
-      // placeholder HTML and is exactly the bug this command is supposed to
-      // replace. Show a clear system message instead.
-      if (typeof runAgenticCodeTask !== "function") {
+      // Hard requirement: the new multi-turn generator must be loaded.
+      // We do NOT silently fall back to the single-pass legacy stub here —
+      // that path produced broken placeholder HTML for multi-step edits and
+      // is exactly the bug /agentic is supposed to replace.
+      if (typeof runAgenticCodeTaskMultiTurn !== "function") {
         if (typeof addMessage === "function") {
           addMessage("system", "Agentic code generator not loaded — refresh the page and retry.");
         }
         return;
       }
-      runAgenticCodeTask({ userText: prompt, recentContext: (typeof safeRecentAgenticContext === "function") ? safeRecentAgenticContext() : null }).catch((err) => {
-        console.error("agentic run failed", err);
-        addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
+      // Promote this chat into "code" mode and persist so subsequent
+      // messages stay in the multi-turn path until the user types /chat.
+      const currentChat = (typeof getSessionById === "function" && typeof currentSessionId !== "undefined")
+        ? getSessionById(currentSessionId)
+        : null;
+      if (currentChat && typeof currentChat === "object") {
+        currentChat.mode = ROK_SESSION_MODE_CODE;
+        currentChat.updatedAt = Date.now();
+        try {
+          if (typeof saveSessionsToStorage === "function") saveSessionsToStorage();
+          if (typeof renderChatModePill === "function") renderChatModePill(currentChat);
+        } catch (_) {}
+      }
+      runAgenticCodeTaskMultiTurn({
+        userText: prompt,
+        recentContext: (typeof safeRecentAgenticContext === "function") ? safeRecentAgenticContext() : null
+      }).catch((err) => {
+        console.error("agentic multi-turn run failed", err);
+        if (typeof addMessage === "function") {
+          addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
+        }
       });
       return;
     }
+  }
+
+  // Handle /chat command — explicit escape valve that flips a chat back
+  // from "Code" (multi-turn agentic loop) to "Chat" (regular flow). The
+  // message body is treated as a normal chat send, not as a coding
+  // directive. There is no UI pill toggle for this on purpose — the design
+  // constraint says Code mode is entered ONLY via /agentic, and leaving
+  // Code mode follows the same command-driven rule.
+  //   /chat why is the bird sliding off the pipe?
+  if (text && /^\/chat\b/i.test(text)) {
+    const rest = text.replace(/^\/chat\b\s*/i, "").trim();
+    const currentChat = (typeof getSessionById === "function" && typeof currentSessionId !== "undefined")
+      ? getSessionById(currentSessionId)
+      : null;
+    if (currentChat && typeof currentChat === "object") {
+      currentChat.mode = ROK_SESSION_MODE_CHAT;
+      currentChat.updatedAt = Date.now();
+      try {
+        if (typeof saveSessionsToStorage === "function") saveSessionsToStorage();
+        if (typeof renderChatModePill === "function") renderChatModePill(currentChat);
+      } catch (_) {}
+      if (typeof addMessage === "function") {
+        addMessage("system", "Switched this chat back to Chat mode. New messages use the regular flow.");
+      }
+    }
+    // If there's no body, we're done. Otherwise fall through so the user's
+    // text gets handled by the regular send path (we DON'T recurse into the
+    // slash-command branch).
+    if (!rest) {
+      if (typeof input !== "undefined" && input) input.value = "";
+      if (typeof autoResizeInput === "function") autoResizeInput();
+      return;
+    }
+    // Re-target `text` so the rest of the handler treats /chat's payload as
+    // a plain chat send.
+    text = rest;
   }
 
   // Handle /pictionary command
@@ -16268,10 +17051,39 @@ async function send() {
     return;
   }
 
+  // Mode-gated routing:
+  //   - chat.mode === "code": every message runs the multi-turn agentic
+  //     loop. There's no ambiguity left — the user explicitly opted into
+  //     Code mode via /agentic, so we never ask "is this a coding request?"
+  //   - chat.mode === "chat": fall back to the legacy auto-detect path so
+  //     short follow-ups after a recent write_file (e.g. "make the pipes
+  //     blue", "fix the bug") can still hit the single-pass agentic path
+  //     without the user having to type /agentic. This matches the old
+  //     behavior for Chat-mode chats.
+  const currentChatForMode = (typeof getSessionById === "function" && typeof currentSessionId !== "undefined")
+    ? getSessionById(currentSessionId)
+    : null;
+  const chatMode = currentChatForMode ? normalizeSessionMode(currentChatForMode.mode) : ROK_SESSION_MODE_CHAT;
+  if (chatMode === ROK_SESSION_MODE_CODE) {
+    if (typeof runAgenticCodeTaskMultiTurn === "function") {
+      runAgenticCodeTaskMultiTurn({
+        userText: String(text || "").trim(),
+        recentContext: (typeof safeRecentAgenticContext === "function") ? safeRecentAgenticContext() : null
+      }).catch((err) => {
+        console.error("code-mode multi-turn run failed", err);
+        if (typeof addMessage === "function") {
+          addMessage("system", `Agentic run failed: ${err && err.message ? err.message : err}`);
+        }
+      });
+      return;
+    }
+  }
+
   // Auto-detect coding requests so ROK uses the real LLM-backed agentic
   // tool caller (writes actual code to browser storage) without the user
   // needing to type `/agentic`. Disabled in incognito mode so incidental
-  // prompts in a private session don't trigger file writes.
+  // prompts in a private session don't trigger file writes. Only runs in
+  // Chat-mode chats — Code-mode chats use the multi-turn loop above.
   // We also pass `recentContext` so short follow-ups after a recent
   // successful agentic run (e.g. "make the pipes blue", "fix the bug") route
   // back here instead of falling through to the regular chat path and
@@ -16280,6 +17092,7 @@ async function send() {
     ? safeRecentAgenticContext()
     : null;
   if (
+    chatMode === ROK_SESSION_MODE_CHAT &&
     text &&
     typeof looksLikeCodingRequest === "function" &&
     looksLikeCodingRequest(text, recentAgentic) &&
@@ -24452,4 +25265,5 @@ async function handlePictionaryCommand() {
     }
   });
 }
+
 });
