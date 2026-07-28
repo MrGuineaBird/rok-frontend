@@ -14761,7 +14761,10 @@ async function streamAgenticTurnOnce({ messages, sessionModel, signal, controlle
     max_tokens: 4096,
     stream: true,
     tools: Array.isArray(AGENTIC_TOOL_DEFINITIONS) ? AGENTIC_TOOL_DEFINITIONS : [],
-    tool_choice: "auto"
+    // Ollama native tool_choice values: "auto" | "any" | "none".
+    // "any" = force at least one tool call per turn.
+    // (See server.py build_local_payload for the OpenAI-vs-Ollama mapping.)
+    tool_choice: "any",
   };
 
   try {
@@ -15093,7 +15096,7 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   // append a new user-role message instead — the model sees both its own
   // chatty reply and this follow-up reminder.
   const AGENTIC_RETRY_DIRECTIVE =
-    "\n\n[ROK directive] Your previous reply did not include a tool call. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"...\">...</rok_file> block. Do NOT reply with empty content or only an apologetic paragraph. If the request is genuinely conversational with no file work to do, end with a single short paragraph and NO tool calls.";
+    "\n\n[ROK directive] Your previous reply did NOT include a tool call. The user typed /agentic, which means they want file work done. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"...\">...</rok_file> block. Do NOT reply with empty content, prose, or a clarifying question. Pick the right tool and call it NOW.";
 
   while (turn < turnCap && !userCancelled && !streamError) {
     turn++;
