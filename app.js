@@ -14800,6 +14800,10 @@ async function streamAgenticTurnOnce({ messages, sessionModel, signal, controlle
     // "any" = force at least one tool call per turn.
     // (See server.py build_local_payload for the OpenAI-vs-Ollama mapping.)
     tool_choice: "any",
+    // Lower temperature / top_p for agentic runs so the model sticks to the
+    // tool schema instead of drifting into conversational prose.
+    temperature: 0.2,
+    top_p: 0.8,
   };
 
   try {
@@ -15134,6 +15138,12 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
     }
   }
 
+  // Hard-stop guardrail for the retry-turn system message. In Code mode every
+  // user message is treated as a coding request, so the model must not be
+  // given an escape hatch that lets it emit prose instead of file work.
+  const AGENTIC_RETRY_SYSTEM_GUARD =
+    "You are in ROK Code mode. The user's last message MUST produce a file operation. If you have nothing to write, call list_files once. Never answer with prose only.";
+
   // The running messages array. The orchestrator pushes the assistant turn
   // (text + tool_calls) and tool role results back here after each iteration
   // so the next request sees the full conversation so far.
@@ -15167,11 +15177,6 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   // chatty reply and this follow-up reminder.
   const AGENTIC_RETRY_DIRECTIVE =
     "\n\n[ROK directive] Your previous reply did NOT include a tool call. The user typed /agentic, which means they want file work done. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"NAME.EXT\">...</rok_file> block. Do NOT reply with empty content, prose, or a clarifying question. Pick the right tool and call it NOW.";
-  // Hard-stop guardrail for the retry-turn system message. In Code mode every
-  // user message is treated as a coding request, so the model must not be
-  // given an escape hatch that lets it emit prose instead of file work.
-  const AGENTIC_RETRY_SYSTEM_GUARD =
-    "You are in ROK Code mode. The user's last message MUST produce a file operation. If you have nothing to write, call list_files once. Never answer with prose only.";
 
   while (turn < turnCap && !userCancelled && !streamError) {
     turn++;
