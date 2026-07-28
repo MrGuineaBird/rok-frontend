@@ -14787,7 +14787,7 @@ async function streamAgenticTurnOnce({ messages, sessionModel, signal, controlle
   // the running messages array verbatim. Disable the legacy history path
   // (history: []) so the backend doesn't see the user-text twice.
   const baseBody = {
-    message: "[multi-turn turn N] see messages[]",
+    message: "",
     messages: messages,
     workspace_context: "",
     history: [],
