@@ -14708,6 +14708,41 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
 // already emits clean "tool_calls" SSE events + done markers.
 // ===========================================================================
 
+// Extract <rok_file path="...">...</rok_file> blocks from arbitrary model
+// prose and return them as synthetic write_file tool calls. Mirrors the
+// fallback already present in runAgenticCodeTask, but isolated so the
+// multi-turn loop can reuse it without touching the single-pass path.
+function extractRokFileBlocksFromText(rawText) {
+  const text = String(rawText || "");
+  if (!text || !/<rok_file\b/i.test(text)) return [];
+  const safeMarkupRe = /<rok_file\b([^>]*)>([\s\S]*?)<\/rok_file>/gi;
+  const results = [];
+  const seen = new Set();
+  let match;
+  while ((match = safeMarkupRe.exec(text)) !== null) {
+    const attrs = String(match[1] || "");
+    const content = String(match[2] || "").trim();
+    if (!content) continue;
+    const pathMatch = attrs.match(/path\s*=\s*["']([^"']+)["']/);
+    const safePath = pathMatch ? pathMatch[1] : "";
+    if (!safePath) continue;
+    if (safePath.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) continue;
+    if (!/^[A-Za-z0-9_./-]+$/.test(safePath)) continue;
+    if (!/\.[A-Za-z0-9]{1,6}$/.test(safePath)) continue;
+    const fp = `${safePath}#${content.length}#${content.slice(0, 200)}`;
+    if (seen.has(fp)) continue;
+    seen.add(fp);
+    results.push({
+      id: `rokfile_${Date.now()}_${results.length}`,
+      function: {
+        name: "write_file",
+        arguments: { path: safePath, content }
+      }
+    });
+  }
+  return results;
+}
+
 // Serialize one tool execution result into a bounded string for re-feed.
 // Heavy on text — keep compact but readable; cap at 8KB so a runaway file
 // doesn't blow the model's context budget on the next turn.
@@ -14896,6 +14931,38 @@ async function streamAgenticTurnOnce({ messages, sessionModel, signal, controlle
       if (parsed) processDataPayload(JSON.stringify(parsed));
     }
 
+    // Safety-net: Hermes 1.4 (gpt-oss:120b-cloud) sometimes ignores the
+    // native tool_calls channel and embeds the file in prose as either a
+    // <rok_file path="...">...</rok_file> block or a JSON "tool_calls"
+    // block. Convert those into synthetic tool_calls so the loop can still
+    // execute them. We only run this when the native channel is empty so a
+    // real native tool call is never shadowed.
+    if (toolCalls.length === 0 && runningText) {
+      const rokFileCalls = extractRokFileBlocksFromText(runningText);
+      for (const tc of rokFileCalls) {
+        const argsKey = JSON.stringify(tc.function.arguments || {});
+        const fp = `${tc.function.name}#${argsKey}`;
+        if (toolCallsFingerprints.has(fp)) continue;
+        toolCallsFingerprints.add(fp);
+        toolCalls.push(tc);
+      }
+      if (toolCalls.length === 0 && runningText.indexOf('"tool_calls"') !== -1) {
+        try {
+          const jsonCalls = extractJsonToolCallsFromProse(runningText);
+          for (const tc of jsonCalls) {
+            if (!tc || !tc.function || !tc.function.name) continue;
+            const argsKey = typeof tc.function.arguments === "string"
+              ? tc.function.arguments
+              : JSON.stringify(tc.function.arguments || {});
+            const fp = `${tc.function.name}#${argsKey}`;
+            if (toolCallsFingerprints.has(fp)) continue;
+            toolCallsFingerprints.add(fp);
+            toolCalls.push(tc);
+          }
+        } catch (_) { /* malformed JSON in prose — ignore */ }
+      }
+    }
+
     if (controller && typeof controller.setSummary === "function") {
       controller.setSummary(`ROK is generating code… ${runningText.length} chars`);
     }
@@ -15071,7 +15138,10 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   // (text + tool_calls) and tool role results back here after each iteration
   // so the next request sees the full conversation so far.
   const messages = [
-    { role: "system", content: AGENTIC_CODING_SYSTEM_PROMPT + editContextLine + editWorkspaceContext },
+    {
+      role: "system",
+      content: AGENTIC_CODING_SYSTEM_PROMPT + editContextLine + editWorkspaceContext + "\n\n" + AGENTIC_RETRY_SYSTEM_GUARD
+    },
     { role: "user", content: messagePayload }
   ];
 
@@ -15096,7 +15166,12 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   // append a new user-role message instead — the model sees both its own
   // chatty reply and this follow-up reminder.
   const AGENTIC_RETRY_DIRECTIVE =
-    "\n\n[ROK directive] Your previous reply did NOT include a tool call. The user typed /agentic, which means they want file work done. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"...\">...</rok_file> block. Do NOT reply with empty content, prose, or a clarifying question. Pick the right tool and call it NOW.";
+    "\n\n[ROK directive] Your previous reply did NOT include a tool call. The user typed /agentic, which means they want file work done. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"NAME.EXT\">...</rok_file> block. Do NOT reply with empty content, prose, or a clarifying question. Pick the right tool and call it NOW.";
+  // Hard-stop guardrail for the retry-turn system message. In Code mode every
+  // user message is treated as a coding request, so the model must not be
+  // given an escape hatch that lets it emit prose instead of file work.
+  const AGENTIC_RETRY_SYSTEM_GUARD =
+    "You are in ROK Code mode. The user's last message MUST produce a file operation. If you have nothing to write, call list_files once. Never answer with prose only.";
 
   while (turn < turnCap && !userCancelled && !streamError) {
     turn++;
@@ -15154,6 +15229,16 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
         : true;
       if (turn === 1 && !retryUsed && promptLooksCoding) {
         retryUsed = true;
+        // Harden the system prompt on the retry turn. Append the guard to
+        // the existing system message so we keep edit context (pre-read
+        // file contents, followup instructions, etc.) while removing any
+        // "genuinely conversational" escape hatch.
+        if (messages[0] && messages[0].role === "system") {
+          messages[0] = {
+            role: "system",
+            content: messages[0].content + "\n\n" + AGENTIC_RETRY_SYSTEM_GUARD
+          };
+        }
         messages.push({
           role: "user",
           content: AGENTIC_RETRY_DIRECTIVE
