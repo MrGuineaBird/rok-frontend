@@ -15006,8 +15006,13 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   const baseMessagePayload = (typeof buildMessageForApi === "function")
     ? String(buildMessageForApi(text, ""))
     : text;
-  const messagePayload = (text.length < 25
-    && typeof AGENTIC_SHORT_PROMPT_AUGMENTER === "string"
+  // Always apply the directive in Code mode (this function is only called
+  // from Code-mode paths). Models like gpt-oss:120b-cloud sometimes
+  // misinterpret words like "messages" or "pipes" as chat history and reply
+  // with prose instead of a tool call — the directive anchors them to their
+  // actual job. The chat UI / history still shows only the user's original
+  // text; the directive lives in the LLM payload only.
+  const messagePayload = (typeof AGENTIC_SHORT_PROMPT_AUGMENTER === "string"
     && AGENTIC_SHORT_PROMPT_AUGMENTER)
     ? `${baseMessagePayload}${AGENTIC_SHORT_PROMPT_AUGMENTER}`
     : baseMessagePayload;
@@ -15078,6 +15083,17 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
   let loopDetected = false;
   let hitTurnCap = false;
   let parseStepId = null;
+  // One-shot retry guard: if turn 1 returns prose instead of a tool call,
+  // we inject a stronger directive as a follow-up user message and let the
+  // loop try again on turn 2. Capped at one retry so genuine chatty replies
+  // ("thanks!", "got it") don't loop.
+  let retryUsed = false;
+  // Stronger nudge used when turn 1 returned 0 tool calls. Note we cannot
+  // mutate the original user message (it's already in messages[]), so we
+  // append a new user-role message instead — the model sees both its own
+  // chatty reply and this follow-up reminder.
+  const AGENTIC_RETRY_DIRECTIVE =
+    "\n\n[ROK directive] Your previous reply did not include a tool call. You MUST respond by calling the native edit_file / write_file / read_file / list_files tool, OR by emitting a single <rok_file path=\"...\">...</rok_file> block. Do NOT reply with empty content or only an apologetic paragraph. If the request is genuinely conversational with no file work to do, end with a single short paragraph and NO tool calls.";
 
   while (turn < turnCap && !userCancelled && !streamError) {
     turn++;
@@ -15114,14 +15130,35 @@ async function runAgenticCodeTaskMultiTurn({ userText, recentContext, maxTurns }
     });
 
     // Append the assistant message (text + tool_calls together so the next
-    // turn sees both). If the model emitted only prose with no tool calls,
-    // that's still a valid final answer — we just won't iterate again.
+    // turn sees both).
     const assistantMsg = { role: "assistant" };
     if (oneTurn.text) assistantMsg.content = oneTurn.text;
     if (oneTurn.toolCalls.length > 0) assistantMsg.tool_calls = oneTurn.toolCalls;
     messages.push(assistantMsg);
 
-    if (oneTurn.toolCalls.length === 0) break; // assistant finished naturally
+    if (oneTurn.toolCalls.length === 0) {
+      // Empty tool-call response handling:
+      //   - Turn 1 + retry still available + prompt looks coding-related:
+      //     model likely misinterpreted the prompt as conversational. Inject
+      //     a stronger directive as a follow-up user message so the model
+      //     sees its own reply plus a nudge, then continue to turn 2.
+      //   - Turn 1 + prompt doesn't look coding-related (genuine chat like
+      //     "thanks!"): don't retry — exit cleanly with the model's prose.
+      //   - Turn 2 after retry (or any later turn): assistant finished
+      //     naturally. Break so the summary composer writes the right text.
+      const promptLooksCoding = typeof looksLikeCodingRequest === "function"
+        ? looksLikeCodingRequest(text, ctx)
+        : true;
+      if (turn === 1 && !retryUsed && promptLooksCoding) {
+        retryUsed = true;
+        messages.push({
+          role: "user",
+          content: AGENTIC_RETRY_DIRECTIVE
+        });
+        continue;
+      }
+      break;
+    }
 
     // Loop detection: if the same tool-call fingerprint repeats across three
     // consecutive turns the agent is stuck. Two consecutive dupes is too
