@@ -13997,6 +13997,55 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
       `Always pass the \`path\` parameter set to \`${safePrimary}\`.`;
   }
 
+  // EDIT-FOLLOWUP: pre-read the existing file contents so the model can edit
+  // in a SINGLE pass (emit edit_file/write_file directly) instead of emitting
+  // a discovery list_files/read_file call first. runAgenticCodeTask is
+  // single-pass — it collects tool calls from one model response, executes
+  // them, and returns. Without the file contents upfront the model's correct
+  // instinct is "I need to see the code first" → list_files → the runner
+  // executes that one discovery call and stops; the actual edit never happens.
+  // Injecting the contents into workspace_context (which the backend formats
+  // as "Workspace context: ...") gives the model everything it needs to edit
+  // in one shot. Try local storage first (instant, no network) — on Render
+  // the files live in localStorage via the passthrough fallback. If that
+  // misses (disk-mode backend), fall back to the networked read. Capped at
+  // 10000 chars to stay under the backend's MAX_MESSAGE_CHARS limit; a
+  // truncation note is appended if the file is larger.
+  let editWorkspaceContext = "";
+  if (ctx && (ctx.primaryPath || (ctx.files && ctx.files[0]))) {
+    const targetPath = ctx.primaryPath || ctx.files[0];
+    // Guard: if the user's text mentions a DIFFERENT filename, this is a
+    // new-file creation request, not an edit of the previous file. Injecting
+    // the old file's contents would waste context and could mislead the model
+    // into editing the wrong file. Skip injection in that case.
+    const mentionedFileMatch = text.match(/\b([a-z0-9_][\w-]*\.(?:html?|js|ts|jsx?|tsx|mjs|cjs|css|scss|json|py|rb|go|rs|java|kt|swift|dart|lua|php|c|cpp|cxx|h|hpp|sh|bash|zsh|sql|ya?ml|toml|xml|svg|md|markdown|txt|csv))\b/i);
+    const mentionsDifferentFile = mentionedFileMatch &&
+      mentionedFileMatch[1].toLowerCase() !== String(targetPath).toLowerCase();
+    if (!mentionsDifferentFile) {
+    try {
+      let readResult = executeLocalFileTool("read_file", { path: targetPath });
+      if (!readResult || !readResult.ok) {
+        readResult = await executeBackendFileTool("read_file", { path: targetPath });
+      }
+      if (readResult && readResult.ok && readResult.result && typeof readResult.result.content === "string") {
+        const rawContent = readResult.result.content;
+        const cap = 10000;
+        const truncated = rawContent.length > cap;
+        const content = truncated ? rawContent.slice(0, cap) : rawContent;
+        editWorkspaceContext =
+          `Current contents of \`${targetPath}\` (the file the user wants to edit):\n` +
+          `\`\`\`\n${content}\n\`\`\`\n` +
+          (truncated ? `\n[File truncated — showing first ${cap} of ${rawContent.length} chars.]\n` : "") +
+          `\nEdit this file directly: use edit_file with an old_string that appears EXACTLY once, or write_file with the FULL updated content. Do NOT call list_files or read_file first — the contents are above.`;
+      }
+    } catch (_) {
+      // Best effort: if the read fails (file deleted, storage cleared, etc.),
+      // fall through with empty workspace_context. The model will discover
+      // via list_files — not ideal, but no worse than the current behavior.
+    }
+    } // end new-file guard: skip injection when user names a different file
+  }
+
   let agenticSystemPrompt = AGENTIC_CODING_SYSTEM_PROMPT + editContextLine;
   if (typeof getCustomPromptOverridesForApi === "function") {
     try {
@@ -14022,7 +14071,7 @@ async function runAgenticCodeTask({ userText, recentContext } = {}) {
   }
   const baseBody = {
     message: messagePayload,
-    workspace_context: "",
+    workspace_context: editWorkspaceContext,
     attachments: [],
     history: [],
     model: sessionModel,
